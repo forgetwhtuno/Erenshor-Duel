@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.4.0 - Native Lunaris migration
+
+- Migrated off BepInEx 5 onto native Lunaris: `BaseUnityPlugin`/`[BepInPlugin]`/`[BepInProcess]`
+  replaced by `LunarisPlugin`/`[LunarisPlugin]`/`[LunarisPermission(Reflection | Harmony)]`;
+  `Logger.Log*` replaced by native `Logging.Log*`. This mod has no BepInEx config entries to
+  migrate (`/eduel` has no persisted settings).
+- This is a loader/logging/lifecycle migration only: no duel eligibility, safety-gate, virtual
+  health, native-damage-routing, third-party-isolation, or cleanup logic changed. Every Harmony
+  patch target was re-verified against the currently installed `Assembly-CSharp.dll`.
+- `BUILD_AND_INSTALL.ps1` rewritten for Lunaris: install target is now
+  `<Erenshor>\plugins\ErenshorDuel.dll`; reference resolution now looks for a Lunaris developer
+  folder (`Lunaris.dll`/`0Harmony.dll`) instead of a BepInEx profile root; all
+  r2modman/Thunderstore BepInEx-profile auto-detection removed.
+- Added `tests/RUN_TESTS.ps1`: a new standalone deterministic test runner for the existing
+  `DuelSelfTests.RunAll()` suite (challenge policy, eligibility policy, locality policy, identity,
+  event contract, safety policy, Deep Sims compatibility) so it can be verified outside a running
+  game. No test logic changed; this only makes the existing `/eduel selftest` suite runnable from
+  the command line for migration verification.
+- Verified: real compile against the installed Erenshor + Lunaris assemblies, zero `BepInEx`
+  references in the compiled output, the full existing deterministic self-test suite passes (7/7
+  policy groups via `tests/RUN_TESTS.ps1`), and a static hot-unload audit (the
+  `SceneManager.sceneLoaded`/`sceneUnloaded` subscriptions installed in `Awake()` are unsubscribed
+  in `OnDestroy()`; `Harmony.UnpatchSelf()` is called; `DuelController.Shutdown()` and both
+  optional-integration `Reset()` calls run before the plugin instance reference is cleared; the
+  only `AppDomain.CurrentDomain.GetAssemblies()` usages are throttled by assembly-count check, not
+  cached via an `AssemblyLoad` subscription).
+- Not yet done: live in-game verification under Lunaris, including hot unload during an active
+  duel. `OnApplicationQuit()`/`OnDestroy()` both still call `DuelController.Stop()`/`Shutdown()` to
+  restore real HP and participant state before teardown, unchanged from the prior BepInEx build,
+  but this has not been re-confirmed live under the new loader.
+
 ## Unreleased development notes (not part of the public 0.3.1 release)
 
 The entries in this section describe source work after 0.3.1. They are retained as development

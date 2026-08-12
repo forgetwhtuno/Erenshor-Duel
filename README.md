@@ -1,9 +1,20 @@
-# Erenshor Practice Duels 0.3.1
+# Erenshor Practice Duels 0.4.0
 
 Erenshor Practice Duels provides friendly, non-lethal simulated sparring between the player and a
 local Sim, or between two local Sims while the player watches. It uses Erenshor's native combat
 calculations where the installed paths have been verified, while virtualizing duel health so a
 practice match does not become ordinary gameplay combat.
+
+## Status: native Lunaris migration candidate
+
+This version has been migrated off BepInEx 5 onto native Lunaris. This is a
+loader/logging/lifecycle migration only — no duel eligibility, safety-gate, virtual-health,
+native-damage-routing, third-party-isolation, or cleanup behavior changed; every Harmony patch
+target has been re-verified against the currently installed `Assembly-CSharp.dll`, and the full
+deterministic self-test suite (`tests/RUN_TESTS.ps1`) still passes. **Live in-game verification
+under Lunaris — including hot unload/reload during an active duel — has not yet been done.** A
+legacy BepInEx release remains available in this repository's Git history for anyone still on
+BepInEx.
 
 ## What it does
 
@@ -44,12 +55,20 @@ used only to exclude unsafe participants. Deep Sims is also optional: when insta
 Duels can emit fact-only lifecycle events for short social reactions. Neither integration gives
 another mod control over duel gameplay.
 
+## Installation
+
+This is a **native Lunaris plugin** — BepInEx is no longer required for this version. Requires
+Lunaris installed in your Erenshor install. The compiled DLL is placed directly in
+`<Erenshor>\plugins\ErenshorDuel.dll`; Lunaris manages enable/disable.
+
 ## Build and validation
 
-`BUILD_AND_INSTALL.ps1` builds against an installed Erenshor copy and installs into the selected
-BepInEx profile. `/eduel selftest` runs deterministic policy tests. Full live validation is still
-required for the installed game version, especially across class, spell, pet, interruption,
-zoning, and teardown combinations.
+`BUILD_AND_INSTALL.ps1` builds against an installed Erenshor copy and installs directly into
+`<Erenshor>\plugins\`. `tests\RUN_TESTS.ps1` runs the deterministic policy self-test suite
+standalone, outside the game. `/eduel selftest` runs the same suite live, in-game. Full live
+validation is still required for the installed game version, especially across class, spell, pet,
+interruption, zoning, and teardown combinations, and now also across a Lunaris load/unload/reload
+cycle.
 
 ## Credits and inspiration
 

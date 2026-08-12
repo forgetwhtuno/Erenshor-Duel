@@ -1038,7 +1038,7 @@ namespace ErenshorDuel
 
         // /eduel diag is intentionally exhaustive for real SimPlayer components. This is the
         // evidence boundary for nearby non-party support: ordinary NPCs/pets do not enter this
-        // list, while every actual SimPlayer gets its exact final policy token in the BepInEx log.
+        // list, while every actual SimPlayer gets its exact final policy token in the Lunaris log.
         private static void LogNearbyCandidateDiagnostic(SimPlayer sim, Character player)
         {
             if (sim == null) return;
@@ -2201,7 +2201,7 @@ namespace ErenshorDuel
 
             return "[Practice Duel] diag: " + total + " SimPlayer(s), " + local + " local, " + eligible +
                 " eligible. active_zone=" + activeZone + " player_scene=" + playerScene +
-                " player_stable=" + playerStable + " (full per-candidate detail in the BepInEx log)";
+                " player_stable=" + playerStable + " (full per-candidate detail in the Lunaris log)";
         }
 
         private static DuelEligibilityDecision EvaluateEligibility(SimPlayer target, Character player,

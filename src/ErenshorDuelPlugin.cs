@@ -1,14 +1,15 @@
 using System;
-using BepInEx;
+using Lunaris;
 using HarmonyLib;
 using UnityEngine;
 using UnityEngine.SceneManagement;
 
 namespace ErenshorDuel
 {
-    [BepInPlugin("forgetwhtuno.erenshor.practice-duels", "Erenshor Practice Duels", "0.3.1")]
-    [BepInProcess("Erenshor.exe")]
-    public sealed class ErenshorDuelPlugin : BaseUnityPlugin
+    [LunarisPlugin("forgetwhtuno.erenshor.practice-duels", "0.4.0", "forgetwhtuno",
+        "Friendly, non-lethal simulated sparring between the player and a local Sim, or between two local Sims while the player watches, using virtualized health inside a bounded duel.")]
+    [LunarisPermission(LunarisPermission.Reflection | LunarisPermission.Harmony)]
+    public sealed class ErenshorDuelPlugin : LunarisPlugin
     {
         internal static ErenshorDuelPlugin Instance;
         private Harmony _harmony;
@@ -27,7 +28,7 @@ namespace ErenshorDuel
                 SceneManager.sceneUnloaded += OnSceneUnloaded;
                 _sceneHooksInstalled = true;
             }
-            Logger.LogInfo("Practice Duels loaded. Use /eduel <SimName>, /eduel <Sim A> vs <Sim B>, /eduel nearby, /eduel status, /eduel diag, /eduel selftest, or /eduel stop.");
+            Logging.LogInfo("Practice Duels loaded. Use /eduel <SimName>, /eduel <Sim A> vs <Sim B>, /eduel nearby, /eduel status, /eduel diag, /eduel selftest, or /eduel stop.");
         }
 
         private void OnSceneLoaded(Scene scene, LoadSceneMode mode)
@@ -51,7 +52,7 @@ namespace ErenshorDuel
             try { DuelController.Tick(); }
             catch (Exception ex)
             {
-                Logger.LogError("Practice duel update failed: " + ex);
+                Logging.LogError("Practice duel update failed: " + ex);
                 DuelController.Cancel("Update.Exception", null, null, null,
                     "Duel cancelled after an internal error: " + ex.GetType().Name + ".");
             }
@@ -80,7 +81,7 @@ namespace ErenshorDuel
 
         internal void Diagnostic(string message)
         {
-            Logger.LogWarning(message);
+            Logging.LogWarning(message);
         }
 
         internal bool Handle(TypeText typeText, string raw)
