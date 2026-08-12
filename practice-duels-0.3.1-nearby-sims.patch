@@ -1,0 +1,835 @@
+diff --git a/src/DuelChallengePolicy.cs b/src/DuelChallengePolicy.cs
+new file mode 100644
+index 0000000..f7ddd65
+--- /dev/null
++++ b/src/DuelChallengePolicy.cs
+@@ -0,0 +1,166 @@
++using System;
++
++namespace ErenshorDuel
++{
++    internal enum DuelSocialDecision
++    {
++        Accept,
++        Decline,
++        DeclineLowHealth,
++        DeclineRecentDuel,
++        DeclineLevelMismatch
++    }
++
++    internal struct DuelWillingnessInput
++    {
++        internal bool IsPartySim;
++        internal bool Rival;
++        internal bool HasHealth;
++        internal int CurrentHealth;
++        internal int MaximumHealth;
++        internal bool HasLevel;
++        internal int PlayerLevel;
++        internal int SimLevel;
++        internal bool RecentDuel;
++        internal string StableKey;
++    }
++
++    internal static class DuelChallengePolicy
++    {
++        internal static DuelSocialDecision Evaluate(DuelWillingnessInput input)
++        {
++            // Preserve established 0.3 behavior for party Sims once mechanical safety is proven.
++            if (input.IsPartySim) return DuelSocialDecision.Accept;
++            if (input.RecentDuel) return DuelSocialDecision.DeclineRecentDuel;
++
++            int score = 5;
++            bool healthConcern = false;
++            bool levelMismatch = false;
++
++            if (input.HasHealth && input.MaximumHealth > 0)
++            {
++                int healthPercent = Math.Max(0, Math.Min(100,
++                    (int)Math.Round(input.CurrentHealth * 100.0 / input.MaximumHealth)));
++                if (healthPercent < 35) return DuelSocialDecision.DeclineLowHealth;
++                if (healthPercent < 60)
++                {
++                    score -= 2;
++                    healthConcern = true;
++                }
++                else if (healthPercent >= 85) score += 1;
++            }
++
++            if (input.HasLevel && input.PlayerLevel > 0 && input.SimLevel > 0)
++            {
++                int lower = Math.Min(input.PlayerLevel, input.SimLevel);
++                int delta = Math.Abs(input.PlayerLevel - input.SimLevel);
++                int seriousMismatch = Math.Max(8, lower / 2);
++                if (delta >= seriousMismatch)
++                {
++                    score -= 3;
++                    levelMismatch = true;
++                }
++                else if (delta <= 3) score += 1;
++            }
++
++            // Rival is a bounded modifier. It cannot bypass mechanical eligibility, cooldown,
++            // or the hard low-health reluctance above.
++            if (input.Rival) score += 2;
++
++            // Stable bounded variation prevents every similarly-ready non-party Sim from making
++            // the same choice. Do not use string.GetHashCode: process stability is not guaranteed.
++            score += StableOffset(input.StableKey);
++
++            if (score >= 5) return DuelSocialDecision.Accept;
++            if (healthConcern) return DuelSocialDecision.DeclineLowHealth;
++            if (levelMismatch) return DuelSocialDecision.DeclineLevelMismatch;
++            return DuelSocialDecision.Decline;
++        }
++
++        internal static string Token(DuelSocialDecision decision)
++        {
++            switch (decision)
++            {
++                case DuelSocialDecision.Accept: return "accept";
++                case DuelSocialDecision.DeclineLowHealth: return "decline_low_health";
++                case DuelSocialDecision.DeclineRecentDuel: return "decline_recent_duel";
++                case DuelSocialDecision.DeclineLevelMismatch: return "decline_level_mismatch";
++                default: return "decline";
++            }
++        }
++
++        internal static string RunSelfTests()
++        {
++            if (Evaluate(new DuelWillingnessInput { IsPartySim = true, RecentDuel = true }) != DuelSocialDecision.Accept)
++                return "FAIL party Sim compatibility";
++
++            DuelWillingnessInput low = new DuelWillingnessInput
++            {
++                HasHealth = true,
++                CurrentHealth = 20,
++                MaximumHealth = 100,
++                StableKey = "low"
++            };
++            if (Evaluate(low) != DuelSocialDecision.DeclineLowHealth)
++                return "FAIL low-health willingness";
++
++            DuelWillingnessInput recent = new DuelWillingnessInput
++            {
++                RecentDuel = true,
++                Rival = true,
++                StableKey = "recent"
++            };
++            if (Evaluate(recent) != DuelSocialDecision.DeclineRecentDuel)
++                return "FAIL recent-duel cooldown";
++
++            // This state declines without Rival but accepts with Rival. Rival changes willingness;
++            // it is not a hard override because the low-health/cooldown checks run first.
++            DuelWillingnessInput rival = new DuelWillingnessInput
++            {
++                HasHealth = true,
++                CurrentHealth = 55,
++                MaximumHealth = 100,
++                HasLevel = true,
++                PlayerLevel = 20,
++                SimLevel = 27,
++                StableKey = "rival-a"
++            };
++            DuelSocialDecision withoutRival = Evaluate(rival);
++            rival.Rival = true;
++            DuelSocialDecision withRival = Evaluate(rival);
++            if (withoutRival == DuelSocialDecision.Accept || withRival != DuelSocialDecision.Accept)
++                return "FAIL Rival bounded modifier";
++
++            DuelWillingnessInput deterministic = new DuelWillingnessInput
++            {
++                HasHealth = true,
++                CurrentHealth = 80,
++                MaximumHealth = 100,
++                HasLevel = true,
++                PlayerLevel = 15,
++                SimLevel = 17,
++                StableKey = "same-state"
++            };
++            DuelSocialDecision first = Evaluate(deterministic);
++            for (int i = 0; i < 8; i++)
++                if (Evaluate(deterministic) != first) return "FAIL deterministic decision";
++
++            return "PASS deterministic willingness policy";
++        }
++
++        private static int StableOffset(string value)
++        {
++            unchecked
++            {
++                uint hash = 2166136261u;
++                string text = value ?? string.Empty;
++                for (int i = 0; i < text.Length; i++)
++                {
++                    hash ^= char.ToLowerInvariant(text[i]);
++                    hash *= 16777619u;
++                }
++                return (int)(hash % 3u) - 1;
++            }
++        }
++    }
++}
+diff --git a/src/DuelController.cs b/src/DuelController.cs
+index 682572f..dc5a7d3 100644
+--- a/src/DuelController.cs
++++ b/src/DuelController.cs
+@@ -1,6 +1,7 @@
+         private static bool _previousGuardSpot;
+         private static Vector3 _previousGuardPosition;
++        private static bool _simWasParty;
+         private static string _simName;
+         private static string _scene;
+         private static int _playerHp;
+         private static int _simHp;
+@@ -9,8 +10,10 @@
+         private static int _playerRealHp;
+         private static int _simRealHp;
+         private static readonly HashSet<StatusEffect> PlayerInitialEffects = new HashSet<StatusEffect>();
+         private static readonly HashSet<StatusEffect> SimInitialEffects = new HashSet<StatusEffect>();
++        private static readonly Dictionary<string, float> LastAcceptedDuelBySim =
++            new Dictionary<string, float>(StringComparer.OrdinalIgnoreCase);
+         [ThreadStatic]
+         private static Character _effectTickOwner;
+         private static int _lastCountdown;
+         private static DuelState _state;
+@@ -21,8 +24,10 @@
+         private static NPC _postDuelSimNpc;
+         private static int _postDuelAttackCleanupFrames;
+         private static readonly MethodInfo ResetNpcAttackAnimationsMethod = AccessTools.Method(typeof(NPC), "ResetAttackAnimations");
+         private const int FinishPercent = 5;
++        private const float ChallengeDistance = 25f;
+         private const float MaximumDistance = 35f;
+         private const float MaximumFightSeconds = 30f;
++        private const float RecentDuelCooldownSeconds = 120f;
+ 
+         internal static bool Active { get { return _state != DuelState.None; } }
+diff --git a/src/DuelController.cs b/src/DuelController.cs
+index 7ba60b6..63f516e 100644
+--- a/src/DuelController.cs
++++ b/src/DuelController.cs
+@@ -65,11 +65,20 @@
+         internal static SimPlayer FindSim(string name, out bool ambiguous)
+         {
+             ambiguous = false;
+             SimPlayer partial = null;
++            Character player = null;
++            try { player = GameData.PlayerControl == null ? null : GameData.PlayerControl.Myself; } catch { }
++            if (!IsAlive(player)) return null;
++
+             foreach (SimPlayer sim in UnityEngine.Object.FindObjectsOfType<SimPlayer>())
+             {
+-                if (!IsUsableSim(sim) || CoopCompatibility.IsRemoteHuman(sim) || !IsPlayerPartySim(sim)) continue;
++                if (!IsUsableSim(sim) || CoopCompatibility.IsRemoteHuman(sim)) continue;
++                Character candidateCharacter = null;
++                try { candidateCharacter = sim.MyStats.Myself; } catch { }
++                if (!IsAlive(candidateCharacter) ||
++                    Vector3.Distance(player.transform.position, candidateCharacter.transform.position) > ChallengeDistance) continue;
++
+                 string candidate = ReadName(sim);
+                 if (candidate.Equals(name, StringComparison.OrdinalIgnoreCase)) return sim;
+                 if (candidate.IndexOf(name, StringComparison.OrdinalIgnoreCase) < 0) continue;
+                 if (partial != null)
+@@ -84,33 +93,84 @@
+         }
+ 
+         internal static void Start(SimPlayer target)
+         {
+-            Stop(null);
+-            if (!IsUsableSim(target) || !IsPlayerPartySim(target) || CoopCompatibility.IsRemoteHuman(target) || GameData.PlayerControl == null ||
+-                GameData.PlayerControl.Myself == null || !GameData.PlayerControl.Myself.Alive)
++            if (Active)
+             {
+-                Say("[Practice Duel] Choose a living local Sim in your current party.", "yellow");
++                Say("[Practice Duel] Finish or stop the current duel before issuing another challenge.", "yellow");
++                return;
++            }
++
++            Character player = null;
++            try { player = GameData.PlayerControl == null ? null : GameData.PlayerControl.Myself; } catch { }
++            if (!IsAlive(player))
++            {
++                Say("[Practice Duel] You are not in a safe state to challenge a Sim.", "yellow");
++                return;
++            }
++            if (!IsUsableSim(target) || CoopCompatibility.IsRemoteHuman(target))
++            {
++                Say("[Practice Duel] Choose a living local SimPlayer.", "yellow");
+                 return;
+             }
+             if (IsCampActive())
+             {
+                 Say("[Practice Duel] End camp mode before starting a duel.", "yellow");
+                 return;
+             }
+ 
+-            _player = GameData.PlayerControl.Myself;
+-            _simPlayer = target;
+-            _sim = target.MyStats.Myself;
+-            _simNpc = _sim.MyNPC;
+-            _simName = ReadName(target);
+-            if (_simNpc == null || Vector3.Distance(_player.transform.position, _sim.transform.position) > 25f)
++            Character simCharacter = null;
++            NPC simNpc = null;
++            try
++            {
++                simCharacter = target.MyStats.Myself;
++                simNpc = simCharacter == null ? null : simCharacter.MyNPC;
++            }
++            catch { }
++            if (!IsAlive(simCharacter) || simNpc == null || simNpc.ThisSim != target)
++            {
++                Say("[Practice Duel] That Sim is missing required local combat components.", "yellow");
++                Diagnostic("eligibility=missing_combat_components sim=" + SafeLabel(ReadName(target)));
++                return;
++            }
++            if (Vector3.Distance(player.transform.position, simCharacter.transform.position) > ChallengeDistance)
+             {
+                 Say("[Practice Duel] Move closer before challenging that Sim.", "yellow");
+-                Clear();
+                 return;
+             }
++            if (HasUnsafeRealCombat(player, simCharacter, simNpc))
++            {
++                Say("[Practice Duel] That challenge is unsafe while real combat is active.", "yellow");
++                Diagnostic("eligibility=real_combat sim=" + SafeLabel(ReadName(target)));
++                return;
++            }
++
++            bool partySim = IsPlayerPartySim(target);
++            DuelSocialDecision decision = EvaluateWillingness(target, player, simCharacter, partySim);
++            string simName = ReadName(target);
+ 
++            Say("[Practice Duel] You challenge " + simName + ".", "lightblue");
++            NotifyDuelEvent("duel_challenge",
++                "The player challenged " + simName + " to a friendly practice duel.",
++                20, false, 0.0);
++
++            if (decision != DuelSocialDecision.Accept)
++            {
++                string token = DuelChallengePolicy.Token(decision);
++                Say("[Practice Duel] " + simName + " declines.", "lightblue");
++                Diagnostic("event=duel_declined sim=" + SafeLabel(simName) + " decision=" + token);
++                NotifyDuelEvent("duel_declined",
++                    simName + " declined the player's friendly practice duel challenge. decision=" + token,
++                    25, false, 0.0);
++                return;
++            }
++
++            _player = player;
++            _simPlayer = target;
++            _sim = simCharacter;
++            _simNpc = simNpc;
++            _simWasParty = partySim;
++            _simName = simName;
+             _playerMax = Math.Max(1, _player.MyStats.CurrentMaxHP);
+             _simMax = Math.Max(1, _sim.MyStats.CurrentMaxHP);
+             _playerRealHp = Math.Max(1, Math.Min(_playerMax, _player.MyStats.CurrentHP));
+             _simRealHp = Math.Max(1, Math.Min(_simMax, _sim.MyStats.CurrentHP));
+@@ -126,8 +186,9 @@
+             _previousGuardPosition = target.GetGuardPos();
+             _scene = SceneManager.GetActiveScene().name;
+             _state = DuelState.AwaitingAcceptance;
+             _stateStartedAt = Time.unscaledTime;
++            LastAcceptedDuelBySim[_simName] = Time.unscaledTime;
+             try
+             {
+                 _simNpc.NPCProcOnHit = null;
+                 _simNpc.NPCProcOnHitChance = 0f;
+@@ -136,6 +197,5 @@
+             {
+                 Cancel("Start.NpcProcGuard", null, null, null, "The duel could not start safely.");
+                 return;
+             }
+-            Say("[Practice Duel] You challenge " + _simName + " to a friendly duel...", "lightblue");
+         }
+diff --git a/src/DuelController.cs b/src/DuelController.cs
+index 36d17c4..57c7162 100644
+--- a/src/DuelController.cs
++++ b/src/DuelController.cs
+@@ -234,9 +234,13 @@
+             {
+                 _state = DuelState.Countdown;
+                 _stateStartedAt = Time.unscaledTime;
+                 _lastCountdown = 4;
+-                Say("[Practice Duel] " + _simName + " accepts. Virtual health only; no death, loot, or faction changes.", "lightblue");
++                Say("[Practice Duel] " + _simName + " accepts.", "lightblue");
++                Diagnostic("event=duel_accepted sim=" + SafeLabel(_simName) + " decision=accept");
++                NotifyDuelEvent("duel_accepted",
++                    _simName + " accepted the player's friendly practice duel challenge. decision=accept",
++                    25, false, 0.0);
+                 return;
+             }
+             if (_state == DuelState.Countdown)
+             {
+@@ -254,6 +258,10 @@
+                 _simNpc.CurrentAggroTarget = _player;
+                 GameData.PlayerControl.CurrentTarget = _sim;
+                 try { _sim.TargetMe(); } catch { }
+                 Say("[Practice Duel] Fight! First to " + FinishPercent + "% virtual health yields.", "lightblue");
++                Diagnostic("event=duel_started sim=" + SafeLabel(_simName));
++                NotifyDuelEvent("duel_started",
++                    "A friendly practice duel started between the player and " + _simName + ".",
++                    35, false, 0.0);
+                 return;
+             }
+diff --git a/src/DuelController.cs b/src/DuelController.cs
+index 9874c9f..a1fc921 100644
+--- a/src/DuelController.cs
++++ b/src/DuelController.cs
+@@ -299,12 +299,18 @@
+         internal static void Stop(string reason)
+         {
++            bool wasActive = Active;
+             bool hadDuelState = Active || _simNpc != null || _simPlayer != null;
+             if (hadDuelState) BeginPostDuelAttackCleanup();
+             if (Active && !string.IsNullOrWhiteSpace(reason) &&
+                 reason.IndexOf("cancel", StringComparison.OrdinalIgnoreCase) >= 0 && !_cancellationLogged)
+                 LogCancellation("Stop.Fallback", null, null, null, reason);
+-            bool completed = !string.IsNullOrWhiteSpace(reason) && reason.IndexOf("Friendly duel complete", StringComparison.OrdinalIgnoreCase) >= 0;
+-            bool playerWon = completed && reason.IndexOf(" yields", StringComparison.OrdinalIgnoreCase) >= 0 &&
++            bool timedOut = !string.IsNullOrWhiteSpace(reason) &&
++                            reason.IndexOf("timed out", StringComparison.OrdinalIgnoreCase) >= 0;
++            bool completed = timedOut || (!string.IsNullOrWhiteSpace(reason) &&
++                             reason.IndexOf("Friendly duel complete", StringComparison.OrdinalIgnoreCase) >= 0);
++            bool playerWon = completed && !timedOut && reason.IndexOf(" yields", StringComparison.OrdinalIgnoreCase) >= 0 &&
+                              reason.IndexOf(_simName == null ? "" : _simName + " yields", StringComparison.OrdinalIgnoreCase) >= 0;
++            bool simWon = completed && !timedOut && !playerWon;
+             string completedSimName = _simName;
++            bool restorePartyMovement = _simWasParty;
+             RestoreRealHealthAndEffects();
+diff --git a/src/DuelController.cs b/src/DuelController.cs
+index 73ff58d..7a11134 100644
+--- a/src/DuelController.cs
++++ b/src/DuelController.cs
+@@ -348,7 +348,9 @@
+                 try
+                 {
+-                    if (_simPlayer != null)
++                    // FreeFollow/AssignGuardSpot are party-management restoration paths. Do not call
++                    // them on a nearby non-party Sim: doing so would create a new persistent state.
++                    if (_simPlayer != null && restorePartyMovement)
+                     {
+                         if (_previousGuardSpot) _simPlayer.AssignGuardSpot(_previousGuardPosition);
+                         else _simPlayer.FreeFollow();
+                     }
+diff --git a/src/DuelController.cs b/src/DuelController.cs
+index 366fc33..f0e1758 100644
+--- a/src/DuelController.cs
++++ b/src/DuelController.cs
+@@ -390,7 +390,36 @@
+             }
++
++            string lifecycleType = null;
++            string lifecycleDescription = null;
++            if (wasActive && completed)
++            {
++                lifecycleType = "duel_completed";
++                if (timedOut)
++                    lifecycleDescription = "The friendly practice duel between the player and " + completedSimName + " completed with no winner.";
++                else if (playerWon)
++                    lifecycleDescription = "The player won a friendly practice duel against " + completedSimName +
++                                           ". winner=player loser=" + completedSimName;
++                else if (simWon)
++                    lifecycleDescription = completedSimName + " won a friendly practice duel against the player." +
++                                           " winner=" + completedSimName + " loser=player";
++            }
++            else if (wasActive && !string.IsNullOrWhiteSpace(reason))
++            {
++                lifecycleType = "duel_cancelled";
++                lifecycleDescription = "The friendly practice duel between the player and " + completedSimName +
++                                       " was cancelled. reason=" + SafeLabel(reason);
++            }
++
+             Clear();
+-            if (completed) NotifyDeepSimsOutcome(completedSimName, playerWon);
++
++            // Exactly one outcome event is emitted by the one Stop transition that owns active
++            // duel state. Later cleanup calls see Active == false and cannot duplicate it.
++            if (lifecycleType == "duel_completed")
++                NotifyDuelEvent(lifecycleType, lifecycleDescription, 75, true, 0.65);
++            else if (lifecycleType == "duel_cancelled")
++                NotifyDuelEvent(lifecycleType, lifecycleDescription, 45, false, 0.0);
++
+             if (!string.IsNullOrWhiteSpace(reason)) Say("[Practice Duel] " + reason, "lightblue");
+         }
+ 
+         private static void BeginPostDuelAttackCleanup()
+diff --git a/src/DuelController.cs b/src/DuelController.cs
+index 194a812..825f85e 100644
+--- a/src/DuelController.cs
++++ b/src/DuelController.cs
+@@ -461,11 +461,129 @@
+             if (actorClass == CombatActorClass.DuelParticipant) return false;
+             return !IsFriendlyPartyClass(actorClass) || !IsDuelParticipantClass(Classify(npc.CurrentAggroTarget));
+         }
+ 
++        private static bool HasUnsafeRealCombat(Character player, Character sim, NPC simNpc)
++        {
++            try
++            {
++                if (simNpc != null && IsAlive(simNpc.CurrentAggroTarget)) return true;
++            }
++            catch { }
++
++            try
++            {
++                if (GameData.AttackingPlayer == null) return false;
++                foreach (NPC npc in GameData.AttackingPlayer)
++                {
++                    if (npc == null || npc.CurrentAggroTarget == null) continue;
++                    if (npc.CurrentAggroTarget == player || npc.CurrentAggroTarget == sim) return true;
++                }
++            }
++            catch { }
++            return false;
++        }
++
++        private static DuelSocialDecision EvaluateWillingness(SimPlayer sim, Character player, Character simCharacter, bool partySim)
++        {
++            int playerLevel;
++            int simLevel;
++            bool hasPlayerLevel = TryReadIntMember(player == null ? null : player.MyStats, "Level", out playerLevel);
++            bool hasSimLevel = TryReadIntMember(simCharacter == null ? null : simCharacter.MyStats, "Level", out simLevel);
++
++            int currentHp = 0;
++            int maximumHp = 0;
++            bool hasHealth = false;
++            try
++            {
++                if (simCharacter != null && simCharacter.MyStats != null)
++                {
++                    currentHp = simCharacter.MyStats.CurrentHP;
++                    maximumHp = simCharacter.MyStats.CurrentMaxHP;
++                    hasHealth = maximumHp > 0;
++                }
++            }
++            catch { }
++
++            DuelWillingnessInput input = new DuelWillingnessInput
++            {
++                IsPartySim = partySim,
++                Rival = ReadRival(sim),
++                HasHealth = hasHealth,
++                CurrentHealth = currentHp,
++                MaximumHealth = maximumHp,
++                HasLevel = hasPlayerLevel && hasSimLevel,
++                PlayerLevel = playerLevel,
++                SimLevel = simLevel,
++                RecentDuel = !partySim && WasRecentlyAccepted(sim),
++                StableKey = ReadName(sim) + "|" + SceneManager.GetActiveScene().name + "|" + playerLevel + "|" + simLevel
++            };
++            return DuelChallengePolicy.Evaluate(input);
++        }
++
++        private static bool WasRecentlyAccepted(SimPlayer sim)
++        {
++            string name = ReadName(sim);
++            float last;
++            return !string.IsNullOrWhiteSpace(name) &&
++                   LastAcceptedDuelBySim.TryGetValue(name, out last) &&
++                   Time.unscaledTime >= last &&
++                   Time.unscaledTime - last < RecentDuelCooldownSeconds;
++        }
++
++        private static bool TryReadIntMember(object instance, string name, out int value)
++        {
++            value = 0;
++            if (instance == null || string.IsNullOrWhiteSpace(name)) return false;
++            try
++            {
++                Type type = instance.GetType();
++                FieldInfo field = type.GetField(name, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
++                if (field != null)
++                {
++                    value = Convert.ToInt32(field.GetValue(instance));
++                    return true;
++                }
++
++                PropertyInfo property = type.GetProperty(name, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
++                if (property != null && property.CanRead)
++                {
++                    value = Convert.ToInt32(property.GetValue(instance, null));
++                    return true;
++                }
++            }
++            catch { }
++            value = 0;
++            return false;
++        }
++
++        private static bool ReadRival(SimPlayer sim)
++        {
++            if (sim == null) return false;
++            try
++            {
++                Type type = sim.GetType();
++                FieldInfo field = type.GetField("Rival", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
++                if (field != null) return Convert.ToBoolean(field.GetValue(sim));
++                PropertyInfo property = type.GetProperty("Rival", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
++                return property != null && property.CanRead && Convert.ToBoolean(property.GetValue(sim, null));
++            }
++            catch { return false; }
++        }
++
++        private static void Diagnostic(string message)
++        {
++            try
++            {
++                if (ErenshorDuelPlugin.Instance != null)
++                    ErenshorDuelPlugin.Instance.Diagnostic("[Practice Duel] " + SafeLabel(message));
++            }
++            catch { }
++        }
++
+         private static bool ParticipantsAreValid()
+         {
+-            return IsAlive(_player) && IsAlive(_sim) && IsUsableSim(_simPlayer) && IsPlayerPartySim(_simPlayer) &&
++            return IsAlive(_player) && IsAlive(_sim) && IsUsableSim(_simPlayer) &&
+                    _simNpc != null && _sim.MyNPC == _simNpc && _simNpc.ThisSim == _simPlayer && !CoopCompatibility.IsRemoteHuman(_simPlayer);
+         }
+ 
+         private static bool TryGetExternalAttacker(out NPC attacker, out Character target)
+diff --git a/src/DuelController.cs b/src/DuelController.cs
+index 0040570..d1b1a61 100644
+--- a/src/DuelController.cs
++++ b/src/DuelController.cs
+@@ -621,5 +621,6 @@
+             _previousGuardSpot = false;
+             _previousGuardPosition = Vector3.zero;
++            _simWasParty = false;
+             _simName = null;
+             _scene = null;
+             _playerHp = _simHp = _playerMax = _simMax = 0;
+diff --git a/src/DuelController.cs b/src/DuelController.cs
+index 6b53b2b..d1515df 100644
+--- a/src/DuelController.cs
++++ b/src/DuelController.cs
+@@ -658,10 +658,7 @@
+-        private static void NotifyDeepSimsOutcome(string simName, bool playerWon)
++        private static void NotifyDuelEvent(string type, string description, int importance, bool importantMemory, double baseChance)
+         {
+-            if (string.IsNullOrWhiteSpace(simName)) return;
+-            string description = playerWon
+-                ? "The player won a friendly practice duel against " + simName + "."
+-                : simName + " won a friendly practice duel against the player.";
++            if (string.IsNullOrWhiteSpace(type) || string.IsNullOrWhiteSpace(description)) return;
+             try
+             {
+                 foreach (Assembly assembly in AppDomain.CurrentDomain.GetAssemblies())
+                 {
+@@ -670,11 +667,9 @@
+                     FieldInfo instanceField = pluginType.GetField("Instance", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static);
+                     object instance = instanceField == null ? null : instanceField.GetValue(null);
+                     MethodInfo notify = pluginType.GetMethod("NotifyObservedGameEvent", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                     if (instance != null && notify != null)
+-                    {
+-                        notify.Invoke(instance, new object[] { "friendly_duel", description, 75, true, 0.65 });
+-                    }
++                        notify.Invoke(instance, new object[] { type, description, importance, importantMemory, baseChance });
+                     return;
+                 }
+             }
+             catch { }
+diff --git a/src/ErenshorDuelPlugin.cs b/src/ErenshorDuelPlugin.cs
+index 6a0eb56..e20f519 100644
+--- a/src/ErenshorDuelPlugin.cs
++++ b/src/ErenshorDuelPlugin.cs
+@@ -4,9 +4,9 @@ using HarmonyLib;
+ using UnityEngine;
+ 
+ namespace ErenshorDuel
+ {
+-    [BepInPlugin("forgetwhtuno.erenshor.practice-duels", "Erenshor Practice Duels", "0.3.0")]
++    [BepInPlugin("forgetwhtuno.erenshor.practice-duels", "Erenshor Practice Duels", "0.3.1")]
+     [BepInProcess("Erenshor.exe")]
+     public sealed class ErenshorDuelPlugin : BaseUnityPlugin
+     {
+         internal static ErenshorDuelPlugin Instance;
+@@ -14,9 +14,9 @@ namespace ErenshorDuel
+         private void Awake()
+         {
+             Instance = this;
+             new Harmony("forgetwhtuno.erenshor.practice-duels").PatchAll();
+-            Logger.LogInfo("Practice Duels loaded. Use /eduel <SimName> or /eduel stop.");
++            Logger.LogInfo("Practice Duels loaded. Use /eduel <SimName>, /eduel status, /eduel selftest, or /eduel stop.");
+         }
+ 
+         private void Update()
+         {
+@@ -55,9 +55,16 @@ namespace ErenshorDuel
+                 return true;
+             }
+             if (argument.Length == 0)
+             {
+-                Chat("[Practice Duel] Usage: /eduel <SimName> or /eduel stop", "yellow");
++                Chat("[Practice Duel] Usage: /eduel <SimName>, /eduel status, /eduel selftest, or /eduel stop", "yellow");
++                return true;
++            }
++            if (argument.Equals("selftest", StringComparison.OrdinalIgnoreCase))
++            {
++                string result = DuelChallengePolicy.RunSelfTests();
++                Chat("[Practice Duel] " + result, "lightblue");
++                Diagnostic("[Practice Duel] selftest=" + result);
+                 return true;
+             }
+             if (argument.Equals("status", StringComparison.OrdinalIgnoreCase))
+             {
+diff --git a/README.md b/README.md
+index e9fee39..6a50f37 100644
+--- a/README.md
++++ b/README.md
+@@ -1,9 +1,9 @@
+-# Erenshor Practice Duels 0.3.0
++# Erenshor Practice Duels 0.3.1
+ 
+-Erenshor Practice Duels is a standalone BepInEx mod for friendly, non-lethal practice matches against local Sim players in the player’s current party.
++Erenshor Practice Duels is a standalone BepInEx mod for friendly, non-lethal simulated sparring against local `SimPlayer` actors. Party Sims remain supported, and 0.3.1 adds challenges to appropriate nearby non-party local Sims.
+ 
+-It is not real PvP and does not add co-op PvP, open-world PK, rewards, guild wars, or duels against other human players.
++It is not real PvP and does not add co-op PvP, open-world PK, rewards, guild wars, tournaments, or duels against other human players.
+ 
+ ## Install
+ 
+ 1. Install BepInEx 5 for Erenshor and launch the modded game once.
+@@ -16,41 +16,104 @@ Pass `-GameDir` or `-BepInExRoot` to `BUILD_AND_INSTALL.ps1` if automatic discov
+ 
+ ```text
+ /eduel <SimName>
+ /eduel status
++/eduel selftest
+ /eduel stop
+ ```
+ 
+-The selected Sim must be living, nearby, local, and in the player’s current party. If Erenshor Follow is installed, its action menu also provides **Challenge to friendly duel**.
++`/eduel <SimName>` searches living nearby `SimPlayer` objects only. Remote COOP humans remain excluded. Ordinary NPCs are not challenge targets unless the runtime object is genuinely represented by `SimPlayer`.
++
++`/eduel selftest` runs the deterministic willingness-policy checks that do not require live Erenshor actors.
++
++## Mechanical eligibility
++
++Mechanical eligibility is a hard safety gate and is separate from social willingness. A challenge is refused before duel state is created when the player or Sim is unavailable/dead, the target is a remote human, required `Character`/`NPC`/`SimPlayer` bindings are missing, the Sim is too far away, camp mode is active, another duel is active, or verified real combat is already targeting the player/candidate.
++
++The current code uses only signals already present in the 0.3 implementation: `SimPlayer`, `Character.Alive`, `NPC.ThisSim`, `NPC.CurrentAggroTarget`, `GameData.AttackingPlayer`, scene-local active objects, and the existing COOP compatibility check. There is no guessed Erenshor “busy”, “travel”, or “zoning” field.
++
++## Social willingness
++
++A mechanically eligible party Sim keeps the established 0.3 behavior and accepts.
++
++A mechanically eligible nearby non-party Sim uses a deterministic game-side willingness policy. It may consider only verified state:
++
++- current Sim HP readiness;
++- a two-minute per-Sim recent accepted-duel cooldown;
++- player/Sim level difference when a runtime `Level` member can actually be read;
++- the Sim’s `Rival` flag when present.
++
++The result is an `accept`, `decline`, `decline_low_health`, `decline_recent_duel`, or `decline_level_mismatch` decision. The numeric score is never shown to the player. `Rival` is a bounded positive modifier and never overrides hard eligibility, the recent-duel cooldown, or the hard low-health reluctance.
++
++Resource readiness, non-combat travel/activity, Deep Sims familiarity, and verified prior Deep Sims duel history are intentionally not used yet because Practice Duels does not currently have a stable public signal/API for them. `decline_busy` is reserved for a future verified non-combat activity signal.
++
++A declined challenge does not snapshot health/effects, change targets/aggro, disable procs, or alter follow/guard state.
+ 
+ ## Friendly-duel rules
+ 
+-- The Sim accepts after a short delay, followed by a three-second countdown.
++- After an accepted challenge, the Sim responds after a short delay followed by a three-second countdown.
+ - The match lasts at most 30 seconds.
+ - Both duelists use virtual health; the first to 5% yields. Pre-duel real health is restored on every exit path.
+ - Native melee, attack skills, single-target offensive spells, magic damage, and interceptable bleed/DoT damage are allowed between the duelists.
+ - Each duelist may use native self-heals, HoTs, lifesteal, and consumable healing. Healing raises virtual health only and is capped at the saved virtual maximum.
+ - No real death, XP, loot, faction change, save-game change, or permanent aggro is intended.
+ - The duel Sim’s normal on-hit proc is disabled for the match and restored afterward. The installed proc path can launch arbitrary effect or summon spells, so it is not yet safe to admit through the 1v1 boundary.
+-- Duel cleanup removes effects added to either duelist during the match and restores health, target, guard/follow, aggro, proc, and attack state.
++- Duel cleanup removes effects added to either duelist during the match and restores health, target, aggro, proc, and attack state.
++- Party follow/guard restoration remains limited to Sims that were actually party members at duel start. A nearby non-party Sim is never sent through `FreeFollow`/party-management restoration during cleanup.
+ 
+ Grouped Sim casts, heals, buffs, party-assist behavior, and friendly Sim pets are suppressed when they would affect either duelist. These attempts are treated as friendly interference rather than proof of real combat, so they do not cancel the duel. Duelists also cannot affect third-party actors while the match is active.
+ 
++A third-party local Sim that cannot be proven to be friendly through the existing party/ownership signals remains `Unknown`; a direct combat interaction with a duelist fails closed by cancelling rather than weakening the 1v1 boundary.
++
+ Mana, endurance, cooldowns, and consumed items remain real. A potion used during a duel is consumed normally even though its health gain is folded into virtual health.
+ 
+ ## Safe cancellation
+ 
+-The duel stops safely when a duelist leaves, dies, changes zones, moves too far away, camp mode starts, the timer expires, or a verified outside hostile directly enters protected party combat.
++The duel stops safely when a duelist leaves, dies, changes zones, moves too far away, camp mode starts, the timer expires, or a verified outside hostile directly enters protected combat.
+ 
+-An unrelated fight elsewhere, a friendly pet, or a party Sim’s Regrowth/buff should not cancel the match. A verified hostile directly targeting, damaging, or applying an effect to either duelist cancels the duel, restores real health first, and then allows Erenshor’s real combat action to continue. The BepInEx log records a compact source/actor/target diagnostic for cancellations.
++An unrelated fight elsewhere, a friendly pet, or a party Sim’s Regrowth/buff should not cancel the match. A verified hostile directly targeting, damaging, or applying an effect to either duelist cancels the duel, restores real health first, and then allows Erenshor’s real combat action to continue. The BepInEx log records compact eligibility, lifecycle, and cancellation diagnostics.
++
++## Optional Deep Sims bridge
++
++Practice Duels has no hard dependency on Deep Sims. When `ErenshorDeepSims.DeepSimsPlugin.NotifyObservedGameEvent` is available at runtime, Practice Duels exposes verified lifecycle events:
++
++```text
++duel_challenge
++duel_accepted
++duel_declined
++duel_started
++duel_completed
++duel_cancelled
++```
++
++Declines include the authoritative game-side decision token in the event description. `duel_completed` includes the verified winner/loser when there is one. Non-outcome lifecycle events use a zero base chatter chance so this bridge does not create a stream of spectator dialogue; the completed duel remains the meaningful social observation.
++
++The LLM never decides whether a duel starts.
+ 
+ ## Co-op
+ 
+-Remote COOP humans are excluded. This mod is deliberately local-Sim-only until an official, authoritative multiplayer/PvP system exists.
++Remote COOP humans are excluded. This mod remains deliberately local-Sim-only until an official, authoritative multiplayer/PvP system exists.
++
++## Deferred work
++
++Incoming Sim-initiated challenges are not implemented in 0.3.1. No verified unobtrusive prompt API was established in this pass, and unsolicited challenges are not worth destabilizing the proven player-to-Sim boundary.
++
++The controller is still internally player-vs-Sim shaped (`_player`, `_sim`, virtual HP fields). A full `DuelParticipant` abstraction was evaluated and deliberately deferred because the 0.3 Harmony interception paths contain many two-participant assumptions. That refactor should be done with a dedicated regression harness before Sim-vs-Sim combat.
++
++## Development status / validation
+ 
+-## Development status
++The 0.3.1 source preserves the 0.3 combat interception paths and adds a pure deterministic willingness self-test. It still needs compilation against the user’s installed Erenshor assemblies and in-game validation for:
+ 
+-The 0.3.0 implementation compiles against the current installed Erenshor assemblies. It still requires in-game validation across melee, caster, skill-using, and healer Sims; player healing and potions; party healer/pet exclusion; hostile interruption; and post-duel health/effect cleanup.
++- party Sim acceptance;
++- nearby non-party Sim challenge/accept/decline;
++- remote COOP and ordinary-NPC exclusion;
++- real-combat ineligibility;
++- low-health, cooldown, level, and Rival willingness behavior;
++- declined challenge leaving combat state untouched;
++- third-party isolation in a non-party duel;
++- hostile interruption restoring real health before real combat continues;
++- Deep Sims absent/present behavior and one outcome event;
++- the existing melee/caster/skill/healing/HoT/lifesteal/potion/effect-cleanup matrix.
+ 
+ `NPCProcOnHit` remains deliberately disabled during practice duels. Re-enable it only after each proc class can be proven to stay inside the same virtual-damage and effect-isolation boundary.
+ 
+ ## License
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 1d59455..201f914 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,6 +1,23 @@
+ # Changelog
+ 
++## 0.3.1 — Nearby Local Sim Challenges (Development)
++
++- Expanded `/eduel <SimName>` from current-party Sims to living nearby local `SimPlayer` actors while retaining party-Sim support.
++- Kept remote COOP humans and ordinary non-`SimPlayer` NPCs outside the challenge path.
++- Split hard mechanical eligibility from deterministic social willingness.
++- Preserved party-Sim auto-accept compatibility after mechanical safety checks.
++- Added bounded non-party willingness using verified HP, recent accepted-duel cooldown, runtime level when readable, and the verified `Rival` flag.
++- Ensured a social decline occurs before health/effect snapshots, target/aggro changes, proc suppression, or party movement restoration.
++- Avoided `FreeFollow`/guard restoration on Sims that were not party members at duel start.
++- Added optional reflection-only lifecycle events for `duel_challenge`, `duel_accepted`, `duel_declined`, `duel_started`, `duel_completed`, and `duel_cancelled`.
++- Added winner/loser data to completed-event descriptions and kept outcome emission single-shot.
++- Added `/eduel selftest` for deterministic willingness-policy checks.
++- Left resource readiness, non-combat activity/travel, Deep Sims familiarity/history, incoming Sim challenges, and a full participant abstraction as explicit TODOs until safe APIs/regression coverage exist.
++- Kept the 0.3 damage, spell, healing, effect, pet/third-party, hostile-cancellation, real-resource, and `NPCProcOnHit` safety behavior unchanged.
++
++Validation remaining: compile against the installed Erenshor assemblies, then complete the nearby-Sim/COOP/NPC/willingness/event matrix plus the existing 0.3 combat regression matrix.
++
+ ## 0.3.0 — Isolated Full-Class Practice Combat (Development)
+ 
+ - Allowed native melee attacks, attack skills, and safely classified single-target offensive spells between duelists.
+ - Mirrored authoritative virtual health into native `CurrentHP` so Erenshor's healer AI can recognize duel injuries.
