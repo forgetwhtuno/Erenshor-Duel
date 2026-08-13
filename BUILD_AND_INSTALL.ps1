@@ -1,6 +1,6 @@
 param(
     [string]$GameDir = "",
-    [string]$BepInExRoot = ""
+    [string]$LunarisLibDir = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -28,20 +28,18 @@ function Find-Game([string]$Explicit) {
     throw "Erenshor installation not found. Pass -GameDir 'C:\path\to\Erenshor'."
 }
 
-function Find-Roots([string]$Explicit, [string]$Game) {
-    if ($Explicit -and (Test-Path (Join-Path $Explicit "BepInEx\core\BepInEx.dll"))) {
-        return ,(Resolve-Path $Explicit).Path
-    }
-    $roots = @()
-    if (Test-Path (Join-Path $Game "BepInEx\core\BepInEx.dll")) { $roots += (Resolve-Path $Game).Path }
-    foreach ($parent in @((Join-Path $env:APPDATA "r2modmanPlus-local\Erenshor\profiles"), (Join-Path $env:APPDATA "Thunderstore Mod Manager\DataFolder\Erenshor\profiles"))) {
-        if (Test-Path $parent) {
-            Get-ChildItem $parent -Directory | ForEach-Object {
-                if (Test-Path (Join-Path $_.FullName "BepInEx\core\BepInEx.dll")) { $roots += $_.FullName }
-            }
+function Find-LunarisLibDir([string]$Explicit, [string]$Game) {
+    $candidates = @()
+    if ($Explicit) { $candidates += $Explicit }
+    $candidates += (Join-Path $ScriptRoot "LunarisLibs")
+    $candidates += $Game
+    foreach ($candidate in ($candidates | Select-Object -Unique)) {
+        if (-not $candidate) { continue }
+        if ((Test-Path (Join-Path $candidate "Lunaris.dll")) -and (Test-Path (Join-Path $candidate "0Harmony.dll"))) {
+            return (Resolve-Path $candidate).Path
         }
     }
-    @($roots | Select-Object -Unique)
+    throw "Could not find Lunaris developer references. Put Lunaris.dll and 0Harmony.dll in '$ScriptRoot\LunarisLibs' or pass -LunarisLibDir."
 }
 
 function Find-Csc {
@@ -52,22 +50,13 @@ function Find-Csc {
 }
 
 $GameDir = Find-Game $GameDir
-$roots = @(Find-Roots $BepInExRoot $GameDir)
-if ($roots.Count -eq 0) { throw "No BepInEx profile found. Launch Erenshor modded once, then rerun this script." }
-if ($roots.Count -gt 1) {
-    for ($i = 0; $i -lt $roots.Count; $i++) { Write-Host ("[{0}] {1}" -f $i, $roots[$i]) }
-    $index = [int](Read-Host "Choose profile number (0-$($roots.Count - 1))")
-    if ($index -lt 0 -or $index -ge $roots.Count) { throw "Invalid profile number: $index" }
-    $InstallRoot = $roots[$index]
-} else { $InstallRoot = $roots[0] }
-
+$LunarisLibDir = Find-LunarisLibDir $LunarisLibDir $GameDir
 $csc = Find-Csc
 $managed = Join-Path $GameDir "Erenshor_Data\Managed"
-$core = Join-Path $InstallRoot "BepInEx\core"
-$pluginDir = Join-Path $InstallRoot "BepInEx\plugins\ErenshorDuel"
+$pluginDir = Join-Path $GameDir "plugins"
 New-Item -ItemType Directory -Force -Path $pluginDir | Out-Null
 $refs = @(
-    (Join-Path $core "BepInEx.dll"), (Join-Path $core "0Harmony.dll"),
+    (Join-Path $LunarisLibDir "Lunaris.dll"), (Join-Path $LunarisLibDir "0Harmony.dll"),
     (Join-Path $managed "Assembly-CSharp.dll"), (Join-Path $managed "netstandard.dll"),
     (Join-Path $managed "UnityEngine.dll"), (Join-Path $managed "UnityEngine.CoreModule.dll"),
     (Join-Path $managed "UnityEngine.UI.dll")

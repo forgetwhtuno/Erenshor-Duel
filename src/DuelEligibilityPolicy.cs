@@ -19,6 +19,13 @@ namespace ErenshorDuel
         internal bool IsSimPlayer;
         internal bool ActiveInHierarchy;
         internal bool InLocalPlayerScene;
+        // Current party membership is itself authoritative proof of locality/scope for the
+        // original, previously-working party-duel path. Party Sims must NOT be additionally
+        // gated by the same-scene predicate the nearby non-party Sim work introduced -- that
+        // predicate is scoped to the nearby non-party category only. See DuelController's
+        // FindSim/NearbySummary/EvaluateEligibility for where InLocalPlayerScene/IsPartyMember
+        // are computed.
+        internal bool IsPartyMember;
         internal bool Alive;
         internal bool RemoteCoop;
         internal bool HasCombatComponents;
@@ -34,7 +41,10 @@ namespace ErenshorDuel
         {
             if (!input.IsSimPlayer) return DuelEligibilityDecision.NotSimPlayer;
             if (!input.ActiveInHierarchy) return DuelEligibilityDecision.Inactive;
-            if (!input.InLocalPlayerScene) return DuelEligibilityDecision.WrongScene;
+            // Scene-locality is the nearby non-party category's requirement. A current party
+            // member proves locality/scope by party membership itself and skips this gate --
+            // restoring the original working party-duel path regardless of the same-scene predicate.
+            if (!input.IsPartyMember && !input.InLocalPlayerScene) return DuelEligibilityDecision.WrongScene;
             if (!input.Alive) return DuelEligibilityDecision.Dead;
             if (input.RemoteCoop) return DuelEligibilityDecision.RemoteCoop;
             if (!input.HasCombatComponents) return DuelEligibilityDecision.MissingCombatComponents;
@@ -101,6 +111,24 @@ namespace ErenshorDuel
             wrongScene.InLocalPlayerScene = false;
             if (Evaluate(wrongScene) != DuelEligibilityDecision.WrongScene)
                 return "FAIL eligibility: same loaded player-scene requirement";
+
+            // REGRESSION TEST: a current party member standing right beside the player (e.g.
+            // "Dancer") must reach Eligible even when the same-scene predicate the nearby-Sim
+            // work introduced would otherwise fail (InLocalPlayerScene = false, mirroring the
+            // player's persistent-scene mismatch symptom that produced "eligibility=wrong_scene"
+            // for every real party Sim). Party membership alone must satisfy locality/scope.
+            DuelEligibilityInput partySimWrongScenePredicate = good;
+            partySimWrongScenePredicate.IsPartyMember = true;
+            partySimWrongScenePredicate.InLocalPlayerScene = false;
+            if (Evaluate(partySimWrongScenePredicate) != DuelEligibilityDecision.Eligible)
+                return "FAIL eligibility: party Sim must not be gated by the nearby-Sim scene predicate";
+
+            // Nearby non-party Sim in a different loaded zone must still be rejected.
+            DuelEligibilityInput nonPartyWrongScene = good;
+            nonPartyWrongScene.IsPartyMember = false;
+            nonPartyWrongScene.InLocalPlayerScene = false;
+            if (Evaluate(nonPartyWrongScene) != DuelEligibilityDecision.WrongScene)
+                return "FAIL eligibility: non-party Sim in another zone must still be rejected";
 
             DuelEligibilityInput missing = good;
             missing.HasCombatComponents = false;
