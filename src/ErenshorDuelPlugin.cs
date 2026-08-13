@@ -14,6 +14,9 @@ namespace ErenshorDuel
         internal static ErenshorDuelPlugin Instance;
         private Harmony _harmony;
         private static bool _sceneHooksInstalled;
+        private string _pendingControlChallenge;
+        private bool _pendingControlStop;
+        private DuelSuiteAuraProvider _auraProvider;
 
         private void Awake()
         {
@@ -28,6 +31,16 @@ namespace ErenshorDuel
                 SceneManager.sceneUnloaded += OnSceneUnloaded;
                 _sceneHooksInstalled = true;
             }
+
+            // Optional Suite Hub transport adapter. Never assumed present; registration failure
+            // must never block normal standalone duel commands.
+            try
+            {
+                _auraProvider = new DuelSuiteAuraProvider();
+                _auraProvider.Register(this);
+            }
+            catch (Exception ex) { Logging.LogError("Duel Suite Aura provider setup failed: " + ex); }
+
             Logging.LogInfo("Practice Duels loaded. Use /eduel <SimName>, /eduel <Sim A> vs <Sim B>, /eduel nearby, /eduel status, /eduel diag, /eduel selftest, or /eduel stop.");
         }
 
@@ -49,7 +62,17 @@ namespace ErenshorDuel
 
         private void Update()
         {
-            try { DuelController.Tick(); }
+            try
+            {
+                if (_pendingControlStop) { _pendingControlStop = false; DuelController.Stop("Practice duel stopped from Suite Hub."); }
+                if (!string.IsNullOrWhiteSpace(_pendingControlChallenge))
+                {
+                    string requested = _pendingControlChallenge; _pendingControlChallenge = null;
+                    bool ambiguous; SimPlayer sim = DuelController.FindSim(requested, out ambiguous);
+                    if (!ambiguous && sim != null && !DuelController.Active) DuelController.Start(sim);
+                }
+                DuelController.Tick();
+            }
             catch (Exception ex)
             {
                 Logging.LogError("Practice duel update failed: " + ex);
@@ -60,6 +83,7 @@ namespace ErenshorDuel
 
         private void OnDestroy()
         {
+            _pendingControlChallenge = null; _pendingControlStop = false;
             DuelController.Shutdown();
             try { if (_harmony != null) _harmony.UnpatchSelf(); } catch { }
             if (_sceneHooksInstalled)
@@ -68,6 +92,8 @@ namespace ErenshorDuel
                 try { SceneManager.sceneUnloaded -= OnSceneUnloaded; } catch { }
                 _sceneHooksInstalled = false;
             }
+            try { if (_auraProvider != null) _auraProvider.Unregister(); } catch { }
+            _auraProvider = null;
             DeepSimsCompatibility.Reset();
             CoopCompatibility.Reset();
             if (Instance == this) Instance = null;
@@ -78,6 +104,13 @@ namespace ErenshorDuel
             try { UpdateSocialLog.LogAdd(message, color); }
             catch { try { UpdateSocialLog.LogAdd(message); } catch { } }
         }
+
+        internal bool RequestControlChallenge(string simName)
+        {
+            if (string.IsNullOrWhiteSpace(simName) || DuelController.Active) return false;
+            _pendingControlChallenge = simName.Trim(); _pendingControlStop = false; return true;
+        }
+        internal bool RequestControlStop() { _pendingControlStop = true; _pendingControlChallenge = null; return true; }
 
         internal void Diagnostic(string message)
         {

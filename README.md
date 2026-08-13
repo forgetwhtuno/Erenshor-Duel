@@ -78,3 +78,12 @@ cycle.
 This project was developed with substantial AI-assisted coding support, guided by design, testing,
 playtesting, audits, and iteration. It is an unofficial community mod and is not affiliated with
 or endorsed by Erenshor's developer.
+
+
+## Optional Suite Hub integration
+
+Erenshor Suite Hub is **optional**. The mod exposes a versioned `DuelControlApi`/Aura surface without a Hub assembly reference or load-order dependency. The descriptor reports concise duel status plus an eligible-local-candidate count. Its action transport remains exactly the authoritative operations already supported by the ControlApi: `challenge` with an explicit Sim-name argument and `stop`.
+
+Practice Duels intentionally has no dedicated module panel or standalone launcher; `/eduel` and existing contextual integrations remain standalone. Remote COOP humans and unrelated actors remain excluded by the same eligibility path used outside Hub.
+
+The current Suite Hub renderer can transport two-argument actions but does not yet render arbitrary argument-entry/action controls on a module page. Therefore the Duel provider advertises `challenge(name)`/`stop` correctly, but this workstream does not invent a fake target selector or modify Hub to surface them as buttons.

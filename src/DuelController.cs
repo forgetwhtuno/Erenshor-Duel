@@ -2149,6 +2149,30 @@ namespace ErenshorDuel
                 : "[Practice Duel] Nearby Sims: " + string.Join(" | ", rows.ToArray());
         }
 
+        internal static string[] EligibleNames()
+        {
+            Character player = null;
+            try { player = GameData.PlayerControl == null ? null : GameData.PlayerControl.Myself; } catch { }
+            if (!IsAlive(player) || !PlayerHealthAllowsDuel(player)) return new string[0];
+            List<string> names = new List<string>();
+            foreach (SimPlayer sim in UnityEngine.Object.FindObjectsOfType<SimPlayer>())
+            {
+                if (sim == null || sim.gameObject == null || !sim.gameObject.activeInHierarchy) continue;
+                if (!IsPlayerPartySim(sim) && !IsSimLocalToActiveZone(sim.gameObject, player)) continue;
+                Character simCharacter = null;
+                try { if (sim.MyStats != null) simCharacter = sim.MyStats.Myself; } catch { }
+                float distance = float.MaxValue;
+                try { distance = Vector3.Distance(player.transform.position, (simCharacter != null ? simCharacter.transform : sim.transform).position); } catch { }
+                if (distance > ChallengeDistance) continue;
+                NPC simNpc; bool partySim;
+                if (EvaluateEligibility(sim, player, out simCharacter, out simNpc, out partySim) != DuelEligibilityDecision.Eligible) continue;
+                string name = ReadName(sim);
+                if (!string.IsNullOrWhiteSpace(name) && !names.Contains(name)) names.Add(name);
+            }
+            names.Sort(System.StringComparer.OrdinalIgnoreCase);
+            return names.ToArray();
+        }
+
         // Unfiltered locality/eligibility dump: every local SimPlayer instance is reported with
         // the exact fields the locality and eligibility predicates evaluated, independent of the
         // 25m challenge distance and of any pass/fail short-circuit. Intended to make "wrong_scene"
