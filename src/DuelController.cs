@@ -139,12 +139,19 @@ namespace ErenshorDuel
 
             foreach (SimPlayer sim in UnityEngine.Object.FindObjectsOfType<SimPlayer>())
             {
-                if (!IsUsableSim(sim) || CoopCompatibility.IsRemoteHuman(sim)) continue;
+                if (CoopCompatibility.IsRemoteHuman(sim)) continue;
+                // Current party membership is authoritative locality/scope proof for the party
+                // path and must not be additionally gated by the nearby-Sim same-scene predicate
+                // (IsUsableSim/IsSimLocalToActiveZone). Nearby non-party Sims still require it.
+                bool candidatePartySim = IsPlayerPartySim(sim);
+                if (!candidatePartySim && !IsUsableSim(sim)) continue;
+                if (candidatePartySim && (sim == null || sim.gameObject == null || !sim.gameObject.activeInHierarchy || sim.MyStats == null)) continue;
                 Character candidateCharacter = null;
                 try { candidateCharacter = sim.MyStats.Myself; } catch { }
-                if (!IsAlive(candidateCharacter) || !IsSimLocalToActiveZone(sim.gameObject, player) ||
-                    !IsSimLocalToActiveZone(candidateCharacter.gameObject, player) ||
-                    Vector3.Distance(player.transform.position, candidateCharacter.transform.position) > ChallengeDistance) continue;
+                if (!IsAlive(candidateCharacter)) continue;
+                if (!candidatePartySim && (!IsSimLocalToActiveZone(sim.gameObject, player) ||
+                    !IsSimLocalToActiveZone(candidateCharacter.gameObject, player))) continue;
+                if (Vector3.Distance(player.transform.position, candidateCharacter.transform.position) > ChallengeDistance) continue;
 
                 string candidate = ReadName(sim);
                 if (candidate.Equals(name, StringComparison.OrdinalIgnoreCase))
@@ -2102,7 +2109,11 @@ namespace ErenshorDuel
             List<string> rows = new List<string>();
             foreach (SimPlayer sim in UnityEngine.Object.FindObjectsOfType<SimPlayer>())
             {
-                if (sim == null || sim.gameObject == null || !sim.gameObject.activeInHierarchy || !IsSimLocalToActiveZone(sim.gameObject, player)) continue;
+                if (sim == null || sim.gameObject == null || !sim.gameObject.activeInHierarchy) continue;
+                // A party Sim's locality/scope is proven by party membership, not the nearby-Sim
+                // same-scene predicate -- otherwise party Sims silently vanish from /eduel nearby
+                // whenever that predicate mis-evaluates. See DuelController.EvaluateEligibility.
+                if (!IsPlayerPartySim(sim) && !IsSimLocalToActiveZone(sim.gameObject, player)) continue;
 
                 Character simCharacter = null;
                 try { if (sim.MyStats != null) simCharacter = sim.MyStats.Myself; } catch { }
@@ -2240,6 +2251,7 @@ namespace ErenshorDuel
                 IsSimPlayer = isSim,
                 ActiveInHierarchy = active,
                 InLocalPlayerScene = sameScene,
+                IsPartyMember = partySim,
                 Alive = alive,
                 RemoteCoop = remote,
                 HasCombatComponents = components,
