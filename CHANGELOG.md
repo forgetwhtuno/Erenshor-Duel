@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased - Suite Hub control-surface refinement
+
+- Kept Practice Duel combat/virtual-health containment unchanged; no new standalone panel or launcher was added.
+- Bounded Hub-facing status to a concise active/idle line plus eligible-local-candidate count while preserving the authoritative `challenge(name)` and `stop` ControlApi/Aura actions.
+- The current Hub renderer does not render arbitrary argument-entry actions, so `challenge(name)` remains transport/API-ready rather than inventing a fake selector or modifying Hub in this workstream.
+
 ## 0.4.0 - Native Lunaris migration
 
 - Migrated off BepInEx 5 onto native Lunaris: `BaseUnityPlugin`/`[BepInPlugin]`/`[BepInProcess]`
@@ -149,3 +155,11 @@ Live validation remains required against the installed Erenshor build for the fu
 - Updated the plugin version to 0.3.0.
 
 Validation remaining: complete the documented in-game melee, caster, skill, healing, potion, party-interference, hostile-interruption, resource, and cleanup matrix.
+
+
+## Unreleased - Suite UI/API coherence handoff
+
+- Added optional, versioned `DuelControlApi` discovery/control surface for Suite Hub without a hard Hub dependency.
+- Kept standalone commands and core gameplay authority intact.
+- Documented the retained panel/launcher policy and Lunaris live-test requirement.
+- Added a primitive-only Hub surface over the existing challenge/stop/eligibility paths; duel containment and the party-locality eligibility fix are preserved.
