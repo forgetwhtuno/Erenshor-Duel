@@ -1,5 +1,7 @@
 # Erenshor Practice Duels 0.4.1
 
+Part of the **Forgotten Roads for Erenshor** mod collection.
+
 Erenshor Practice Duels provides friendly, non-lethal simulated sparring between the player and a
 local Sim, or between two local Sims while the player watches. It uses Erenshor's native combat
 calculations where the installed paths have been verified, while virtualizing duel health so a
@@ -91,7 +93,7 @@ or endorsed by Erenshor's developer.
 
 ## Optional Suite Hub integration
 
-Erenshor Suite Hub is **optional**. The mod exposes a versioned `DuelControlApi`/Aura surface without a Hub assembly reference or load-order dependency. The descriptor reports concise duel status plus an eligible-local-candidate count. Its action transport remains exactly the authoritative operations already supported by the ControlApi: `challenge` with an explicit Sim-name argument and `stop`.
+Forgotten Roads Hub is **optional**. The mod exposes a versioned `DuelControlApi`/Aura surface without a Hub assembly reference or load-order dependency. The descriptor reports concise duel status plus an eligible-local-candidate count. Its action transport remains exactly the authoritative operations already supported by the ControlApi: `challenge` with an explicit Sim-name argument and `stop`.
 
 Practice Duels intentionally has no dedicated module panel or standalone launcher; `/eduel` and existing contextual integrations remain standalone. Remote COOP humans and unrelated actors remain excluded by the same eligibility path used outside Hub.
 
