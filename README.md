@@ -13,7 +13,7 @@ The combat boundary remains native-adjacent: Erenshor computes admitted duel dam
 
 Terminal restore is ownership-aware. If native gameplay selects a new unrelated player/NPC target during teardown, Duel does not replay an older target over it, and the post-duel autoattack scrub releases ownership immediately. Party-scope changes, participant invalidation, zoning, and direct outside hostile ingress cancel deterministically. Idle shutdown remains quiet.
 
-The deterministic self-test suite and installed-reference build pass against the current local Erenshor/Lunaris installation. Version 0.4.1 also routes both normal and emergency terminal paths through the same party Guard/follow restoration helper. Full live verification remains required for winner, timeout, manual stop, immediate repeat, hostile interruption, participant invalidation, zoning, and unload/reload.
+The deterministic self-test suite passes for the current source snapshot. A fresh installed-reference build and plugin-identity audit are still pending because the current Lunaris resolver is unavailable in this session. Version 0.4.1 also routes both normal and emergency terminal paths through the same party Guard/follow restoration helper. Full live verification remains required for winner, timeout, manual stop, immediate repeat, hostile interruption, participant invalidation, zoning, and unload/reload.
 
 ## What it does
 
