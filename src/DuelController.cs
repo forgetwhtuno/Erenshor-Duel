@@ -9,7 +9,6 @@ namespace ErenshorDuel
 {
     internal static class DuelController
     {
-        private enum DuelState { None, AwaitingAcceptance, Countdown, Fighting }
         private enum CombatActorClass
         {
             DuelParticipant,
@@ -93,7 +92,7 @@ namespace ErenshorDuel
         [ThreadStatic]
         private static NativeDamageState _nativeDamageInFlight;
         private static int _lastCountdown;
-        private static DuelState _state;
+        private static DuelLifecycleState _state;
         private static float _stateStartedAt;
         private static bool _cancellationLogged;
         private static string _cancellationReasonToken;
@@ -119,7 +118,23 @@ namespace ErenshorDuel
         // symmetrically to the player as a Start() precondition.
         private const int MinimumPlayerHealthPercent = 35;
 
-        internal static bool Active { get { return _state != DuelState.None; } }
+        internal static bool Active { get { return DuelLifecyclePolicy.IsSessionActive(_state); } }
+        internal static bool CanStartNewDuel { get { return DuelLifecyclePolicy.CanStart(_state); } }
+
+        private static bool Transition(DuelLifecycleTrigger trigger, string reason)
+        {
+            DuelLifecycleState next;
+            if (!DuelLifecyclePolicy.TryTransition(_state, trigger, out next))
+            {
+                Diagnostic("state_transition_rejected from=" + _state + " trigger=" + trigger + " reason=" + SafeLabel(reason));
+                return false;
+            }
+            DuelLifecycleState previous = _state;
+            _state = next;
+            _stateStartedAt = Time.unscaledTime;
+            Diagnostic("state_transition " + previous + "->" + next + " trigger=" + trigger + " reason=" + SafeLabel(reason));
+            return true;
+        }
 
         internal static SimPlayer FindSim(string name, out bool ambiguous)
         {
@@ -173,9 +188,11 @@ namespace ErenshorDuel
 
         internal static void Start(SimPlayer target)
         {
-            if (Active)
+            if (!CanStartNewDuel)
             {
-                Say("[Practice Duel] Finish or stop the current duel before issuing another challenge.", "yellow");
+                Say(_state == DuelLifecycleState.Cleaning
+                    ? "[Practice Duel] Finishing cleanup from the previous duel. Try again in a moment."
+                    : "[Practice Duel] Finish or stop the current duel before issuing another challenge.", "yellow");
                 return;
             }
 
@@ -260,8 +277,11 @@ namespace ErenshorDuel
             Scene activeZone = SceneManager.GetActiveScene();
             _scene = activeZone.name;
             _sceneHandle = activeZone.handle;
-            _state = DuelState.AwaitingAcceptance;
-            _stateStartedAt = Time.unscaledTime;
+            if (!Transition(DuelLifecycleTrigger.ChallengeAccepted, "player challenge accepted"))
+            {
+                EmergencyCleanup("Start.StateTransition");
+                return;
+            }
             Diagnostic("duel_start build=" + DuelBuildInfo.Id +
                 " playerReal=" + _playerRealHp + "/" + _playerMax +
                 " opponentReal=" + _simRealHp + "/" + _simMax +
@@ -286,6 +306,7 @@ namespace ErenshorDuel
             if (!Active) return;
             if (DuelSafetyPolicy.CancelForSceneMismatch(true, PlayerStillInStartingScene())) { Cancel("Tick.Zone", null, null, null, "Duel cancelled after changing zones."); return; }
             if (!ParticipantsAreValid()) { Cancel("Tick.Participants", null, null, null, "Duel cancelled because a duelist is no longer available."); return; }
+            if (!ParticipantScopesStillMatch()) { Cancel("Tick.PartyScope", null, null, null, "Duel cancelled because a participant's party membership changed."); return; }
             if (Vector3.Distance(_player.transform.position, _sim.transform.position) > MaximumDistance) { Cancel("Tick.Distance", null, null, null, "Duel cancelled because the duelists moved too far apart."); return; }
             if (IsCampActive(false)) { Cancel("Tick.Camp", null, null, null, "Duel cancelled because Hunt Camp is active."); return; }
             NPC externalAttacker;
@@ -298,10 +319,13 @@ namespace ErenshorDuel
             }
 
             float elapsed = Time.unscaledTime - _stateStartedAt;
-            if (_state == DuelState.AwaitingAcceptance && elapsed >= 1f)
+            if (_state == DuelLifecycleState.Preparing && elapsed >= 1f)
             {
-                _state = DuelState.Countdown;
-                _stateStartedAt = Time.unscaledTime;
+                if (!Transition(DuelLifecycleTrigger.PreparationElapsed, "acceptance delay elapsed"))
+                {
+                    Cancel("Tick.StatePreparing", null, null, null, "Duel cancelled after an invalid preparation transition.");
+                    return;
+                }
                 _lastCountdown = 4;
                 Say("[Practice Duel] " + _simName + " accepts.", "lightblue");
                 RememberAcceptedDuel(_simStableKey);
@@ -312,7 +336,7 @@ namespace ErenshorDuel
                     NotifyDuelEvent(DuelEventFactory.Accepted(_simName, _simWasParty), 25, false, 0.0);
                 return;
             }
-            if (_state == DuelState.Countdown)
+            if (_state == DuelLifecycleState.Countdown)
             {
                 int count = Math.Max(1, 3 - (int)elapsed);
                 if (count != _lastCountdown)
@@ -321,9 +345,11 @@ namespace ErenshorDuel
                     Say("[Practice Duel] " + count + "...", "lightblue");
                 }
                 if (elapsed < 3f) return;
-                EndPostDuelAttackCleanup();
-                _state = DuelState.Fighting;
-                _stateStartedAt = Time.unscaledTime;
+                if (!Transition(DuelLifecycleTrigger.CountdownElapsed, "countdown complete"))
+                {
+                    Cancel("Tick.StateCountdown", null, null, null, "Duel cancelled after an invalid countdown transition.");
+                    return;
+                }
                 MirrorVirtualHealth();
                 _simNpc.CurrentAggroTarget = _player;
                 if (_spectatorDuel)
@@ -340,7 +366,7 @@ namespace ErenshorDuel
                     NotifyDuelEvent(DuelEventFactory.Started(_simName, _simWasParty), 35, false, 0.0);
                 return;
             }
-            if (_state == DuelState.Fighting)
+            if (_state == DuelLifecycleState.Active)
             {
                 MirrorVirtualHealth();
                 if (elapsed >= MaximumFightSeconds)
@@ -372,7 +398,7 @@ namespace ErenshorDuel
             catch (Exception ex)
             {
                 try { Diagnostic("Stop.Exception " + ex.GetType().Name); } catch { }
-                try { Clear(); } catch { }
+                EmergencyCleanup("Stop.Exception." + ex.GetType().Name);
             }
         }
 
@@ -391,7 +417,28 @@ namespace ErenshorDuel
         private static void StopInternal(string reason)
         {
             bool wasActive = Active;
-            bool hadDuelState = DuelSafetyPolicy.ShouldRunCleanup(Active, _simNpc != null || _simPlayer != null || _firstSimNpc != null);
+            bool hasResidualParticipantState = _player != null || _sim != null || _simNpc != null || _simPlayer != null ||
+                _firstSimNpc != null || _firstSimPlayer != null;
+            bool hadDuelState = DuelSafetyPolicy.ShouldRunCleanup(Active, hasResidualParticipantState);
+            // Shutdown and repeated stop requests are normal lifecycle paths. If there is no active
+            // duel and no residual participant state, there is nothing to restore and nothing worth
+            // emitting as a terminal diagnostic.
+            if (!hadDuelState) return;
+
+            if (wasActive)
+            {
+                if (!Transition(DuelLifecycleTrigger.Terminal, "terminal cleanup"))
+                    _state = DuelLifecycleState.Cleaning;
+            }
+            else if (_state == DuelLifecycleState.Idle)
+            {
+                // Residual participant references without an active session are unexpected, but
+                // cleanup still owns them. Enter Cleaning explicitly so no new duel can start on
+                // top of a half-restored session.
+                _state = DuelLifecycleState.Cleaning;
+                _stateStartedAt = Time.unscaledTime;
+            }
+
             bool autoAttackBefore = ReadPlayerAutoattack();
             string targetBefore = DescribeActor(GameData.PlayerControl == null ? null : GameData.PlayerControl.CurrentTarget);
             bool externalCombatPresent = HasUnsafeRealCombat(_player, _sim, _simNpc);
@@ -399,7 +446,7 @@ namespace ErenshorDuel
                 " cleanup=" + hadDuelState + " autoAttackBefore=" + autoAttackBefore +
                 " targetBefore=" + targetBefore + " externalCombatPresent=" + externalCombatPresent);
             if (hadDuelState) BeginPostDuelAttackCleanup();
-            if (Active && !string.IsNullOrWhiteSpace(reason) &&
+            if (wasActive && !string.IsNullOrWhiteSpace(reason) &&
                 reason.IndexOf("cancel", StringComparison.OrdinalIgnoreCase) >= 0 && !_cancellationLogged)
                 LogCancellation("Stop.Fallback", null, null, null, reason);
             bool timedOut = !string.IsNullOrWhiteSpace(reason) &&
@@ -421,9 +468,14 @@ namespace ErenshorDuel
                 {
                     if (_simNpc != null)
                     {
-                        Character restoredTarget = IsAlive(_previousSimTarget) && _previousSimTarget != _player && _previousSimTarget != _sim
-                            ? _previousSimTarget : null;
-                        _simNpc.CurrentAggroTarget = restoredTarget;
+                        Character currentTarget = _simNpc.CurrentAggroTarget;
+                        bool currentTargetIsDuelOwned = currentTarget == _player || currentTarget == _sim;
+                        bool previousTargetIsDuelist = _previousSimTarget == _player || _previousSimTarget == _sim;
+                        if (currentTargetIsDuelOwned)
+                        {
+                            _simNpc.CurrentAggroTarget = DuelSafetyPolicy.ShouldRestorePreviousNpcTarget(
+                                true, IsAlive(_previousSimTarget), previousTargetIsDuelist) ? _previousSimTarget : null;
+                        }
                         if (_simNpc.PastAggroTarget == _player || _simNpc.PastAggroTarget == _sim)
                             _simNpc.PastAggroTarget = null;
                         ResetNpcAttackAnimations(_simNpc);
@@ -441,18 +493,11 @@ namespace ErenshorDuel
                 catch { }
                 try
                 {
-                    // FreeFollow/AssignGuardSpot are party-management restoration paths. Do not call
-                    // them on a nearby non-party Sim: doing so would create a new persistent state.
-                    if (_simPlayer != null && restorePartyMovement)
-                    {
-                        if (_previousGuardSpot) _simPlayer.AssignGuardSpot(_previousGuardPosition);
-                        else _simPlayer.FreeFollow();
-                    }
-                }
-                catch { }
-                try
-                {
-                    if (!_spectatorDuel) ForceStopPlayerAttack();
+                    Character currentPlayerTarget = GameData.PlayerControl == null ? null : GameData.PlayerControl.CurrentTarget;
+                    bool currentPlayerTargetIsDuelOwned = currentPlayerTarget == _player || currentPlayerTarget == _sim;
+                    if (!_spectatorDuel && DuelSafetyPolicy.ShouldSuppressPostDuelAutoAttack(
+                        currentPlayerTargetIsDuelOwned, currentPlayerTarget == null))
+                        ForceStopPlayerAttack();
                     if (!_spectatorDuel && GameData.PlayerControl != null && GameData.PlayerControl.CurrentTarget == _sim)
                     {
                         // The usual pre-duel target is the Sim the player clicked to challenge.
@@ -474,9 +519,14 @@ namespace ErenshorDuel
                 {
                     if (_firstSimNpc != null)
                     {
-                        Character restoredTarget = IsAlive(_previousFirstSimTarget) && _previousFirstSimTarget != _player && _previousFirstSimTarget != _sim
-                            ? _previousFirstSimTarget : null;
-                        _firstSimNpc.CurrentAggroTarget = restoredTarget;
+                        Character currentTarget = _firstSimNpc.CurrentAggroTarget;
+                        bool currentTargetIsDuelOwned = currentTarget == _player || currentTarget == _sim;
+                        bool previousTargetIsDuelist = _previousFirstSimTarget == _player || _previousFirstSimTarget == _sim;
+                        if (currentTargetIsDuelOwned)
+                        {
+                            _firstSimNpc.CurrentAggroTarget = DuelSafetyPolicy.ShouldRestorePreviousNpcTarget(
+                                true, IsAlive(_previousFirstSimTarget), previousTargetIsDuelist) ? _previousFirstSimTarget : null;
+                        }
                         if (_firstSimNpc.PastAggroTarget == _player || _firstSimNpc.PastAggroTarget == _sim)
                             _firstSimNpc.PastAggroTarget = null;
                         _firstSimNpc.NPCProcOnHit = _previousFirstNpcProc;
@@ -485,16 +535,9 @@ namespace ErenshorDuel
                     }
                 }
                 catch { }
-                try
-                {
-                    if (_firstSimPlayer != null && restoreFirstPartyMovement)
-                    {
-                        if (_previousFirstGuardSpot) _firstSimPlayer.AssignGuardSpot(_previousFirstGuardPosition);
-                        else _firstSimPlayer.FreeFollow();
-                    }
-                }
-                catch { }
             }
+
+            RestorePartyMovementOwnership();
 
             RestoreInitialNearbyEnemyMembership();
 
@@ -521,7 +564,8 @@ namespace ErenshorDuel
 
             string targetAfter = DescribeActor(GameData.PlayerControl == null ? null : GameData.PlayerControl.CurrentTarget);
             bool autoAttackAfter = ReadPlayerAutoattack();
-            Clear();
+            ClearSessionState();
+            RunPostDuelAttackCleanup();
             Diagnostic("cleanup autoAttackBefore=" + autoAttackBefore + " autoAttackAfter=" + autoAttackAfter +
                 " targetBefore=" + targetBefore + " targetAfter=" + targetAfter +
                 " externalCombatPresent=" + externalCombatPresent + " virtualStateCleared=" + (!Active && _playerHp == 0 && _simHp == 0));
@@ -546,19 +590,29 @@ namespace ErenshorDuel
             _postDuelStopLocalPlayer = !_spectatorDuel;
             _postDuelAttackCleanupFrames = 6;
             _postDuelAttackCleanupUntil = Time.unscaledTime + 2f;
-            RunPostDuelAttackCleanup();
         }
 
         private static void RunPostDuelAttackCleanup()
         {
             if (_postDuelAttackCleanupFrames <= 0 && Time.unscaledTime >= _postDuelAttackCleanupUntil) return;
-            if (_postDuelStopLocalPlayer) ForceStopPlayerAttack();
             try
             {
-                if (_postDuelStopLocalPlayer && GameData.PlayerControl != null &&
-                    (GameData.PlayerControl.CurrentTarget == _postDuelPlayer ||
-                     GameData.PlayerControl.CurrentTarget == _postDuelSim))
-                    GameData.PlayerControl.CurrentTarget = null;
+                if (_postDuelStopLocalPlayer && GameData.PlayerControl != null)
+                {
+                    Character current = GameData.PlayerControl.CurrentTarget;
+                    bool duelOwned = current == _postDuelPlayer || current == _postDuelSim;
+                    if (DuelSafetyPolicy.ShouldSuppressPostDuelAutoAttack(duelOwned, current == null))
+                    {
+                        ForceStopPlayerAttack();
+                        if (duelOwned) GameData.PlayerControl.CurrentTarget = null;
+                    }
+                    else
+                    {
+                        // A new unrelated target is authoritative evidence that native gameplay
+                        // has moved on. Stop policing the player's attack loop immediately.
+                        _postDuelStopLocalPlayer = false;
+                    }
+                }
             }
             catch { }
             try
@@ -598,12 +652,47 @@ namespace ErenshorDuel
             _postDuelFirstSimNpc = null;
             _postDuelStopLocalPlayer = false;
             PostDuelPetNpcs.Clear();
+            if (_state == DuelLifecycleState.Cleaning)
+            {
+                DuelLifecycleState next;
+                if (DuelLifecyclePolicy.TryTransition(_state, DuelLifecycleTrigger.CleanupComplete, out next))
+                    _state = next;
+                else
+                    _state = DuelLifecycleState.Idle;
+                _stateStartedAt = 0f;
+            }
         }
 
         private static void ResetNpcAttackAnimations(NPC npc)
         {
             if (npc == null || ResetNpcAttackAnimationsMethod == null) return;
             try { ResetNpcAttackAnimationsMethod.Invoke(npc, null); } catch { }
+        }
+
+        // Party movement/Guard state is temporary duel ownership. Keep this idempotent and call it
+        // from both ordinary and emergency terminal paths before participant references are cleared.
+        // Nearby non-party Sims are deliberately excluded: FreeFollow/AssignGuardSpot would create
+        // persistent party-management state that did not exist before the duel.
+        private static void RestorePartyMovementOwnership()
+        {
+            try
+            {
+                if (_simPlayer != null && _simWasParty)
+                {
+                    if (_previousGuardSpot) _simPlayer.AssignGuardSpot(_previousGuardPosition);
+                    else _simPlayer.FreeFollow();
+                }
+            }
+            catch { }
+            try
+            {
+                if (_spectatorDuel && _firstSimPlayer != null && _firstSimWasParty)
+                {
+                    if (_previousFirstGuardSpot) _firstSimPlayer.AssignGuardSpot(_previousFirstGuardPosition);
+                    else _firstSimPlayer.FreeFollow();
+                }
+            }
+            catch { }
         }
 
         // ForceAttackOff() alone was observed to leave the player still auto-attacking after a
@@ -669,9 +758,11 @@ namespace ErenshorDuel
 
         internal static void StartSpectator(SimPlayer first, SimPlayer second)
         {
-            if (Active)
+            if (!CanStartNewDuel)
             {
-                Say("[Practice Duel] Finish or stop the current duel before issuing another challenge.", "yellow");
+                Say(_state == DuelLifecycleState.Cleaning
+                    ? "[Practice Duel] Finishing cleanup from the previous duel. Try again in a moment."
+                    : "[Practice Duel] Finish or stop the current duel before issuing another challenge.", "yellow");
                 return;
             }
             if (first == null || second == null || first == second)
@@ -770,8 +861,11 @@ namespace ErenshorDuel
             Scene activeZone = SceneManager.GetActiveScene();
             _scene = activeZone.name;
             _sceneHandle = activeZone.handle;
-            _state = DuelState.AwaitingAcceptance;
-            _stateStartedAt = Time.unscaledTime;
+            if (!Transition(DuelLifecycleTrigger.ChallengeAccepted, "spectator challenge accepted"))
+            {
+                EmergencyCleanup("StartSpectator.StateTransition");
+                return;
+            }
             try
             {
                 _firstSimNpc.NPCProcOnHit = null;
@@ -817,7 +911,7 @@ namespace ErenshorDuel
 
         private static void MirrorVirtualHealth()
         {
-            if (_state != DuelState.Fighting) return;
+            if (_state != DuelLifecycleState.Active) return;
             MirrorOne(_player, _playerHp, _playerMax);
             MirrorOne(_sim, _simHp, _simMax);
         }
@@ -960,8 +1054,9 @@ namespace ErenshorDuel
 
         internal static string Status()
         {
+            if (_state == DuelLifecycleState.Cleaning) return "[Practice Duel] Cleanup is finishing; no duel damage is active.";
             if (!Active) return "[Practice Duel] No duel is active.";
-            if (_state != DuelState.Fighting) return _spectatorDuel
+            if (_state != DuelLifecycleState.Active) return _spectatorDuel
                 ? "[Practice Duel] Preparing " + _firstSimName + " vs " + _simName + "."
                 : "[Practice Duel] Preparing to duel " + _simName + ".";
             return "[Practice Duel] " + ParticipantLabel(_player) + ": " + Percent(_playerHp, _playerMax) + "% | " +
@@ -1025,6 +1120,7 @@ namespace ErenshorDuel
 
             DeepSimsCompatibility.CampStatus camp = DeepSimsCompatibility.GetCampStatus();
             return "[Practice Duel DIAG] build=" + DuelBuildInfo.Id +
+                   " lifecycle=" + _state +
                    " active=" + Active +
                    " playerAlive=" + playerAlive +
                    " playerActiveInHierarchy=" + playerActive +
@@ -1202,7 +1298,7 @@ namespace ErenshorDuel
             if (actor == null || target == null) return false;
             Character principal = DuelPrincipal(actor);
             return DuelSafetyPolicy.AllowPreExistingPetEngagement(
-                _state == DuelState.Fighting,
+                _state == DuelLifecycleState.Active,
                 actor == _player || actor == _sim,
                 AllowedDuelPets.Contains(actor),
                 principal != null,
@@ -1246,7 +1342,7 @@ namespace ErenshorDuel
             bool simHit = duelHit && target == _sim;
             if (!duelHit) return !TryVirtualDamage(target, attacker, rawDamage, ref result, source);
             if (attacker != _player && attacker != _sim) RememberEngagedPet(attacker);
-            if (_state != DuelState.Fighting)
+            if (_state != DuelLifecycleState.Active)
             {
                 result = 0;
                 return false;
@@ -1287,6 +1383,14 @@ namespace ErenshorDuel
         internal static void FinishNativeDamage(NativeDamageState state, int nativeResult)
         {
             if (state == null || state.Target == null) return;
+            // A nested native callback can terminate the duel before the outer DamageMe postfix
+            // runs. Never apply a stale virtual ledger after terminal cleanup has restored real
+            // health and cleared participant ownership.
+            if (!DuelLifecyclePolicy.IsCombatActive(_state) || (state.Target != _player && state.Target != _sim))
+            {
+                RestoreNativeHitState(state);
+                return;
+            }
             string factionLabel = state.FactionChanged ? state.OriginalFaction + "->duel" : "unchanged";
             int effective = state.CapturedReduceHp
                 ? Math.Max(0, state.CapturedReduceHpDamage)
@@ -1352,7 +1456,7 @@ namespace ErenshorDuel
             bool simHit = duelHit && target == _sim;
             if (duelHit)
             {
-                if (_state != DuelState.Fighting)
+                if (_state != DuelLifecycleState.Active)
                 {
                     result = 0;
                     return true;
@@ -1369,7 +1473,7 @@ namespace ErenshorDuel
             if (target == _effectTickOwner && (target == _player || target == _sim) &&
                 eventSource.IndexOf("BleedDamageMe", StringComparison.Ordinal) >= 0)
             {
-                if (_state != DuelState.Fighting) { result = 0; return true; }
+                if (_state != DuelLifecycleState.Active) { result = 0; return true; }
                 ApplyVirtualDamage(target, damage, eventSource, "periodic_bleed_unattributed=true");
                 result = damage;
                 return true;
@@ -1396,23 +1500,22 @@ namespace ErenshorDuel
                 return true;
             }
 
-            // An unresolved actor damaging a duelist has to be suppressed, not allowed through.
-            // The commonest unresolved actor is a nearby non-party Sim or a member of its
-            // independent Sim group: Classify() cannot call those hostile, but letting the hit run
-            // natively applies real damage to a duelist whose CurrentHP is currently standing in for
-            // virtual duel health, and a large enough hit reaches Erenshor's death path directly.
-            // This matches how AllowSpellStart and AllowStatusEffect already treat Unknown sources.
-            if (IsDuelParticipantClass(targetClass) && attackerClass == CombatActorClass.Unknown)
+            DuelOutsideEffectDisposition directIngress = DuelSafetyPolicy.DirectHostileIngress(
+                IsDuelParticipantClass(targetClass), IsFriendlyPartyClass(attackerClass),
+                attackerClass == CombatActorClass.OutsideHostile, attackerClass == CombatActorClass.Unknown);
+            if (directIngress == DuelOutsideEffectDisposition.Block)
             {
                 result = 0;
                 return true;
             }
-
-            // A verified outside NPC damaging any protected party member cancels. An unresolved
-            // actor is sufficient only when the direct victim is one of the two duelists.
-            if (ShouldCancelForHostileRelation(attackerClass, targetClass))
+            if (directIngress == DuelOutsideEffectDisposition.Cancel)
             {
-                Cancel(eventSource, attacker, target, target, "Duel cancelled because an outside actor directly damaged a protected party member.");
+                // The direct damage call itself is authoritative evidence that an outside actor is
+                // participating, even when its exact actor category is unknown (e.g. a COOP proxy
+                // or non-party Sim). Restore real duel state first, then let Erenshor process the
+                // outside hit normally.
+                Cancel(eventSource, attacker, target, target,
+                    "Duel cancelled because an outside actor directly damaged a duelist.");
                 return false;
             }
 
@@ -1443,7 +1546,7 @@ namespace ErenshorDuel
         internal static bool HandleSelfDamage(Character target, int amount, ref int result, string eventSource)
         {
             if (!Active || (target != _player && target != _sim)) return true;
-            if (_state != DuelState.Fighting) { result = 0; return false; }
+            if (_state != DuelLifecycleState.Active) { result = 0; return false; }
             if (amount > 0)
             {
                 ApplyVirtualDamage(target, amount, eventSource, "self_damage=true");
@@ -1496,7 +1599,7 @@ namespace ErenshorDuel
             if (actorClass == CombatActorClass.DuelParticipant)
             {
                 Character opponent = DuelOpponentFor(npc);
-                if (_state == DuelState.Fighting && target == opponent) npc.CurrentAggroTarget = opponent;
+                if (_state == DuelLifecycleState.Active && target == opponent) npc.CurrentAggroTarget = opponent;
                 return false;
             }
 
@@ -1509,10 +1612,12 @@ namespace ErenshorDuel
                 return true;
             }
 
-            // A verified outside NPC aggroing a protected party member cancels. Unknown actors
-            // require a direct aggro relation with one of the two duelists.
-            if (ShouldCancelForHostileRelation(actorClass, targetClass))
-                Cancel(eventSource, NpcCharacter(npc), target, target, "Duel cancelled because an outside actor directly acquired a protected party target.");
+            DuelOutsideEffectDisposition directIngress = DuelSafetyPolicy.DirectHostileIngress(
+                IsDuelParticipantClass(targetClass), IsFriendlyPartyClass(actorClass),
+                actorClass == CombatActorClass.OutsideHostile, actorClass == CombatActorClass.Unknown);
+            if (directIngress == DuelOutsideEffectDisposition.Cancel)
+                Cancel(eventSource, NpcCharacter(npc), target, target,
+                    "Duel cancelled because an outside actor directly acquired a duelist as an aggro target.");
             return true;
         }
 
@@ -1525,9 +1630,12 @@ namespace ErenshorDuel
             if (recipientClass == CombatActorClass.DuelParticipant && IsFriendlyPartyClass(attackerClass)) return false;
             if (IsDuelParticipantClass(attackerClass)) return false;
 
-            if (ShouldCancelForHostileRelation(attackerClass, recipientClass))
+            DuelOutsideEffectDisposition directIngress = DuelSafetyPolicy.DirectHostileIngress(
+                IsDuelParticipantClass(recipientClass), IsFriendlyPartyClass(attackerClass),
+                attackerClass == CombatActorClass.OutsideHostile, attackerClass == CombatActorClass.Unknown);
+            if (directIngress == DuelOutsideEffectDisposition.Cancel)
                 Cancel(eventSource, attacker, NpcCharacter(npc), NpcCharacter(npc),
-                    "Duel cancelled because an outside actor directly generated threat against a protected party member.");
+                    "Duel cancelled because an outside actor directly generated threat against a duelist.");
             return true;
         }
 
@@ -1541,7 +1649,7 @@ namespace ErenshorDuel
             {
                 // The old guard returned false for every selected-Sim attack spell and skill.
                 // Permit native class offense only during the fight and only against the player.
-                return _state == DuelState.Fighting && npc.CurrentAggroTarget == DuelOpponentFor(npc);
+                return _state == DuelLifecycleState.Active && npc.CurrentAggroTarget == DuelOpponentFor(npc);
             }
             if (!IsFriendlyPartyClass(actorClass)) return true;
             Character currentTarget = npc.CurrentAggroTarget;
@@ -1559,7 +1667,7 @@ namespace ErenshorDuel
 
             if (IsDuelParticipantClass(casterClass))
             {
-                if (_state != DuelState.Fighting) return BlockSpell(ref result);
+                if (_state != DuelLifecycleState.Active) return BlockSpell(ref result);
 
                 Character casterCharacter = caster.MyChar;
                 Character targetCharacter = target == null ? null : target.Myself;
@@ -1715,7 +1823,7 @@ namespace ErenshorDuel
         //   - everyone else sees both duelists at full health, so they never pick them at all.
         internal static void BeginDuelistHealEvaluation(NPC npc, ref HealEvaluationState state)
         {
-            if (!Active || _state != DuelState.Fighting || npc == null) return;
+            if (!Active || _state != DuelLifecycleState.Active || npc == null) return;
             state = new HealEvaluationState();
             if (!IsDuelingNpc(npc))
             {
@@ -1825,7 +1933,7 @@ namespace ErenshorDuel
             }
             if (IsDuelParticipantClass(tickOwnerClass) && !IsDuelParticipantClass(targetClass))
                 return false;
-            if (_state != DuelState.Fighting || !IsDuelParticipantClass(targetClass)) return true;
+            if (_state != DuelLifecycleState.Active || !IsDuelParticipantClass(targetClass)) return true;
             state = BeginHealCapture(target);
             return true;
         }
@@ -1850,7 +1958,7 @@ namespace ErenshorDuel
 
             if (IsDuelParticipantClass(targetClass))
             {
-                if (_state == DuelState.Fighting && source != null && source == target.Myself && IsDuelParticipantClass(sourceClass))
+                if (_state == DuelLifecycleState.Active && source != null && source == target.Myself && IsDuelParticipantClass(sourceClass))
                 {
                     state = BeginHealCapture(target);
                     return true;
@@ -1878,7 +1986,7 @@ namespace ErenshorDuel
 
         internal static void FinishHeal(HealCapture state)
         {
-            if (!Active || _state != DuelState.Fighting || state == null || !state.Track || state.Target == null) return;
+            if (!Active || _state != DuelLifecycleState.Active || state == null || !state.Track || state.Target == null) return;
             int gained = Math.Max(0, state.Target.CurrentHP - state.Before);
             if (state.Target.Myself == _player) _playerHp = Math.Max(1, Math.Min(_playerMax, _playerHp + gained));
             else if (state.Target.Myself == _sim) _simHp = Math.Max(1, Math.Min(_simMax, _simHp + gained));
@@ -1899,7 +2007,7 @@ namespace ErenshorDuel
 
             if (IsDuelParticipantClass(sourceClass))
             {
-                if (_state != DuelState.Fighting) { result = 0; return false; }
+                if (_state != DuelLifecycleState.Active) { result = 0; return false; }
                 if (target.Myself == source) return IsSelfContainedDuelCast(spell) || BlockStatusEffect(ref result);
                 if (IsDuelParticipantClass(targetClass) && IsSafeDuelOffense(spell)) return true;
                 result = 0;
@@ -2056,19 +2164,17 @@ namespace ErenshorDuel
                     if (actor == null || actor.NearbyEnemies == null) continue;
                     if (_player != null && actor != _player)
                     {
-                        if ((pair.Value & 1) != 0)
-                        {
-                            if (!actor.NearbyEnemies.Contains(_player)) actor.NearbyEnemies.Add(_player);
-                        }
-                        else actor.NearbyEnemies.Remove(_player);
+                        bool existed = (pair.Value & 1) != 0;
+                        bool existsNow = actor.NearbyEnemies.Contains(_player);
+                        if (DuelSafetyPolicy.ShouldRestoreInitialEnemyMembership(existed, existsNow))
+                            actor.NearbyEnemies.Add(_player);
                     }
                     if (_sim != null && actor != _sim)
                     {
-                        if ((pair.Value & 2) != 0)
-                        {
-                            if (!actor.NearbyEnemies.Contains(_sim)) actor.NearbyEnemies.Add(_sim);
-                        }
-                        else actor.NearbyEnemies.Remove(_sim);
+                        bool existed = (pair.Value & 2) != 0;
+                        bool existsNow = actor.NearbyEnemies.Contains(_sim);
+                        if (DuelSafetyPolicy.ShouldRestoreInitialEnemyMembership(existed, existsNow))
+                            actor.NearbyEnemies.Add(_sim);
                     }
                 }
             }
@@ -2077,11 +2183,9 @@ namespace ErenshorDuel
             {
                 if (_player != null && _player.NearbyEnemies != null && _sim != null)
                 {
-                    if (_playerInitiallyHadSimEnemy)
-                    {
-                        if (!_player.NearbyEnemies.Contains(_sim)) _player.NearbyEnemies.Add(_sim);
-                    }
-                    else _player.NearbyEnemies.Remove(_sim);
+                    bool existsNow = _player.NearbyEnemies.Contains(_sim);
+                    if (DuelSafetyPolicy.ShouldRestoreInitialEnemyMembership(_playerInitiallyHadSimEnemy, existsNow))
+                        _player.NearbyEnemies.Add(_sim);
                 }
             }
             catch { }
@@ -2345,13 +2449,13 @@ namespace ErenshorDuel
         {
             try
             {
-                if (player == null || player.MyStats == null) return true;
+                if (player == null || player.MyStats == null) return false;
                 int max = player.MyStats.CurrentMaxHP;
-                if (max <= 0) return true;
+                if (max <= 0) return false;
                 int percent = Mathf.Clamp(Mathf.RoundToInt(player.MyStats.CurrentHP * 100f / max), 0, 100);
                 return percent >= MinimumPlayerHealthPercent;
             }
-            catch { return true; }
+            catch { return false; }
         }
 
         private static bool HasUnsafeRealCombat(Character player, Character sim, NPC simNpc)
@@ -2364,14 +2468,12 @@ namespace ErenshorDuel
 
             try
             {
-                if (GameData.PlayerCombat != null && PlayerAutoattackField != null &&
-                    Convert.ToBoolean(PlayerAutoattackField.GetValue(GameData.PlayerCombat)))
-                {
-                    Character current = GameData.PlayerControl == null ? null : GameData.PlayerControl.CurrentTarget;
-                    if (IsAlive(current) && current != sim) return true;
-                }
+                bool capabilityAvailable = GameData.PlayerCombat != null && PlayerAutoattackField != null;
+                bool autoAttackActive = capabilityAvailable &&
+                    Convert.ToBoolean(PlayerAutoattackField.GetValue(GameData.PlayerCombat));
+                if (!DuelSafetyPolicy.CanStartWithPreExistingAutoAttack(capabilityAvailable, autoAttackActive)) return true;
             }
-            catch { }
+            catch { return true; }
 
             try
             {
@@ -2575,13 +2677,38 @@ namespace ErenshorDuel
         {
             Character localPlayer = null;
             try { localPlayer = GameData.PlayerControl == null ? null : GameData.PlayerControl.Myself; } catch { }
-            bool secondValid = IsAlive(_sim) && IsUsableSim(_simPlayer) && _simNpc != null &&
-                               _sim.MyNPC == _simNpc && _simNpc.ThisSim == _simPlayer && !CoopCompatibility.IsRemoteHuman(_simPlayer);
-            if (!secondValid || !IsAlive(localPlayer)) return false;
+            if (!IsAlive(localPlayer)) return false;
+
+            bool secondValid = IsParticipantRuntimeValid(_simPlayer, _sim, _simNpc, _simWasParty);
+            if (!secondValid) return false;
             if (!_spectatorDuel) return _player == localPlayer && IsAlive(_player);
-            return IsAlive(_player) && IsUsableSim(_firstSimPlayer) && _firstSimNpc != null &&
-                   _player.MyNPC == _firstSimNpc && _firstSimNpc.ThisSim == _firstSimPlayer &&
-                   !CoopCompatibility.IsRemoteHuman(_firstSimPlayer);
+            return IsParticipantRuntimeValid(_firstSimPlayer, _player, _firstSimNpc, _firstSimWasParty);
+        }
+
+        private static bool IsParticipantRuntimeValid(SimPlayer sim, Character actor, NPC npc, bool wasPartyMember)
+        {
+            try
+            {
+                if (sim == null || actor == null || npc == null || sim.gameObject == null || !sim.gameObject.activeInHierarchy) return false;
+                if (sim.MyStats == null || sim.MyStats.Myself != actor || !IsAlive(actor)) return false;
+                if (actor.MyNPC != npc || npc.ThisSim != sim || CoopCompatibility.IsRemoteHuman(sim)) return false;
+                // Nearby non-party support requires loaded-zone locality. Party Sims use the same
+                // authoritative party-scope rule as start eligibility; the player's persistent
+                // scene has previously made the generic same-scene predicate unreliable for them.
+                if (!wasPartyMember && (!IsSimLocalToActiveZone(sim.gameObject, actor) ||
+                    !IsSimLocalToActiveZone(actor.gameObject, actor))) return false;
+                return true;
+            }
+            catch { return false; }
+        }
+
+        private static bool ParticipantScopesStillMatch()
+        {
+            bool secondPartyNow = IsPlayerPartySim(_simPlayer);
+            if (!DuelSafetyPolicy.PartyScopeStillMatches(_simWasParty, secondPartyNow)) return false;
+            if (!_spectatorDuel) return true;
+            bool firstPartyNow = IsPlayerPartySim(_firstSimPlayer);
+            return DuelSafetyPolicy.PartyScopeStillMatches(_firstSimWasParty, firstPartyNow);
         }
 
         private static bool TryGetExternalAttacker(out NPC attacker, out Character target)
@@ -2596,7 +2723,10 @@ namespace ErenshorDuel
                     if (npc == null || npc.CurrentAggroTarget == null) continue;
                     CombatActorClass actorClass = Classify(npc);
                     CombatActorClass targetClass = Classify(npc.CurrentAggroTarget);
-                    if (!ShouldCancelForHostileRelation(actorClass, targetClass)) continue;
+                    DuelOutsideEffectDisposition directIngress = DuelSafetyPolicy.DirectHostileIngress(
+                        IsDuelParticipantClass(targetClass), IsFriendlyPartyClass(actorClass),
+                        actorClass == CombatActorClass.OutsideHostile, actorClass == CombatActorClass.Unknown);
+                    if (directIngress != DuelOutsideEffectDisposition.Cancel) continue;
                     attacker = npc;
                     target = npc.CurrentAggroTarget;
                     return true;
@@ -2733,14 +2863,6 @@ namespace ErenshorDuel
             return actorClass == CombatActorClass.DuelParticipant || actorClass == CombatActorClass.LocalPlayer;
         }
 
-        private static bool ShouldCancelForHostileRelation(CombatActorClass actorClass, CombatActorClass targetClass)
-        {
-            if (actorClass == CombatActorClass.OutsideHostile) return IsDuelParticipantClass(targetClass);
-            // An unresolved actor is not evidence of outside combat by itself. Suppress the
-            // action instead; cancellation requires an authoritative hostile classification.
-            return false;
-        }
-
         private static bool IsPlayerPartySim(SimPlayer sim)
         {
             try
@@ -2865,10 +2987,67 @@ namespace ErenshorDuel
             return clean.Length <= 120 ? clean : clean.Substring(0, 120);
         }
 
-        private static void Clear()
+        private static void EmergencyCleanup(string source)
+        {
+            try { Diagnostic("emergency_cleanup source=" + SafeLabel(source)); } catch { }
+
+            if (DuelLifecyclePolicy.IsSessionActive(_state))
+            {
+                DuelLifecycleState next;
+                if (DuelLifecyclePolicy.TryTransition(_state, DuelLifecycleTrigger.Terminal, out next)) _state = next;
+                else _state = DuelLifecycleState.Cleaning;
+            }
+            else if (_state == DuelLifecycleState.Idle)
+            {
+                _state = DuelLifecycleState.Cleaning;
+            }
+
+            // Restore the narrowest irreversible/native state first. Every operation is isolated so
+            // one damaged actor cannot prevent the other participant from being recovered.
+            try { RestoreNativeHitState(_nativeDamageInFlight); } catch { }
+            try { RestoreRealHealthAndEffects(); } catch { }
+            try { ReleaseEngagedPets(); } catch { }
+            try
+            {
+                if (_simNpc != null)
+                {
+                    _simNpc.NPCProcOnHit = _previousNpcProc;
+                    _simNpc.NPCProcOnHitChance = _previousNpcProcChance;
+                    if (_simNpc.CurrentAggroTarget == _player || _simNpc.CurrentAggroTarget == _sim)
+                        _simNpc.CurrentAggroTarget = null;
+                    if (_simNpc.PastAggroTarget == _player || _simNpc.PastAggroTarget == _sim)
+                        _simNpc.PastAggroTarget = null;
+                    ResetNpcAttackAnimations(_simNpc);
+                }
+            }
+            catch { }
+            try
+            {
+                if (_firstSimNpc != null)
+                {
+                    _firstSimNpc.NPCProcOnHit = _previousFirstNpcProc;
+                    _firstSimNpc.NPCProcOnHitChance = _previousFirstNpcProcChance;
+                    if (_firstSimNpc.CurrentAggroTarget == _player || _firstSimNpc.CurrentAggroTarget == _sim)
+                        _firstSimNpc.CurrentAggroTarget = null;
+                    if (_firstSimNpc.PastAggroTarget == _player || _firstSimNpc.PastAggroTarget == _sim)
+                        _firstSimNpc.PastAggroTarget = null;
+                    ResetNpcAttackAnimations(_firstSimNpc);
+                }
+            }
+            catch { }
+            try { RestoreInitialNearbyEnemyMembership(); } catch { }
+            try { RestorePartyMovementOwnership(); } catch { }
+            try { BeginPostDuelAttackCleanup(); } catch { }
+            try { ClearSessionState(); } catch { }
+            try { RunPostDuelAttackCleanup(); } catch { }
+        }
+
+        private static void ClearSessionState()
         {
             try { RestoreInitialNearbyEnemyMembership(); } catch { }
-            _state = DuelState.None;
+            try { RestoreNativeHitState(_nativeDamageInFlight); } catch { }
+            _nativeDamageInFlight = null;
+            _effectTickOwner = null;
             _player = null;
             _sim = null;
             _spectatorDuel = false;

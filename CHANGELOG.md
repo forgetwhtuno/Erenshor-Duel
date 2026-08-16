@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.4.1 - RC terminal cleanup proof
+
+- Restores party Guard/follow movement ownership from both normal and emergency terminal paths before participant references are cleared.
+- Adds deterministic source-contract guards for health/effect, pet, enemy-list, movement, attack-loop, session, zone, invalid-participant, external-combat, timeout, and repeat-duel cleanup boundaries.
+- Adds an exact version to startup output and a release-identifiable build id.
+
+## Unreleased - deep state ownership / repeated-duel hardening
+
+- Replaced the implicit active/terminal split with an explicit `Idle -> Preparing -> Countdown -> Active -> Cleaning -> Idle` lifecycle. The two-second terminal scrub is now a real `Cleaning` state that blocks a new challenge until cleanup finishes instead of mutating combat after the session appeared idle.
+- Made terminal restoration ownership-aware: a new unrelated player/NPC target selected after the duel is preserved; post-duel autoattack cleanup stops policing the player as soon as native gameplay selects an unrelated target; nearby-enemy restoration is additive-only and never removes relationships that appeared during the duel.
+- Cancel active duels when a participant changes party scope, when a direct outside/unknown actor damages or acquires aggro on a duelist, or when participant identity/locality becomes invalid. Known friendly-party interference remains blocked rather than dogpiling.
+- Fail duel start closed when player-health or native-autoattack evidence cannot be read safely. Clear duel-scoped thread-static damage/effect ownership on every terminal path and guard native damage postfixes against stale re-entrant completion after cleanup.
+- Added an emergency best-effort restoration path for unexpected cleanup exceptions and clear queued name-based Hub challenge requests on scene load/unload so delayed control callbacks cannot cross zone boundaries.
+- Extended deterministic policy coverage for lifecycle transitions, ten repeated duel cycles, party-scope changes, target/autoattack ownership, direct hostile ingress, additive enemy-list restoration, and exactly-once terminal behavior.
+- Combat formulas, reward behavior, native death suppression, eligibility scope, spectator feature scope, and optional social integration were not expanded by this pass.
+
+## Unreleased - playable-state cleanup polish
+
+- Made idle/repeated `Stop()` and normal plugin shutdown silent when no duel or residual participant state exists; cleanup still runs if any duel participant reference survives unexpectedly.
+- Routed ordinary duel lifecycle diagnostics to debug severity instead of warning severity. Real exceptions/errors keep their existing error paths.
+- Fail practice-duel start closed whenever native player autoattack is already active, so Duel never takes ownership of a pre-existing attack loop it would later need to reconstruct.
+- No virtual-health, native effective-damage, reward, third-party isolation, faction-restoration, aggro cleanup, or duel-completion logic was weakened.
+
 ## Unreleased - Suite Hub control-surface refinement
 
 - Kept Practice Duel combat/virtual-health containment unchanged; no new standalone panel or launcher was added.
