@@ -25,7 +25,7 @@
 
 ## Unreleased - Suite Hub control-surface refinement
 
-- Kept Practice Duel combat/virtual-health containment unchanged; no new standalone panel or launcher was added.
+- Kept Practice Duel combat/virtual-health containment unchanged; documented the existing shared Hub-aware retained fallback entry point rather than adding another gameplay UI surface.
 - Bounded Hub-facing status to a concise active/idle line plus eligible-local-candidate count while preserving the authoritative `challenge(name)` and `stop` ControlApi/Aura actions.
 - The current Hub renderer does not render arbitrary argument-entry actions, so `challenge(name)` remains transport/API-ready rather than inventing a fake selector or modifying Hub in this workstream.
 

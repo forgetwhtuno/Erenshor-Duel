@@ -3,6 +3,7 @@ using Lunaris;
 using HarmonyLib;
 using UnityEngine;
 using UnityEngine.SceneManagement;
+using ForgottenRoads.StandaloneUi;
 
 namespace ErenshorDuel
 {
@@ -44,7 +45,14 @@ namespace ErenshorDuel
             catch (Exception ex) { Logging.LogError("Duel Suite Aura provider setup failed: " + ex); }
 
             Logging.LogInfo("Practice Duels " + PluginVersion + " loaded. Use /eduel <SimName>, /eduel <Sim A> vs <Sim B>, /eduel nearby, /eduel status, /eduel diag, /eduel selftest, or /eduel stop.");
+            StandaloneFallbackUi.Initialize(this, "duel", "PRACTICE DUEL",
+                "Select a Sim for the full Sim Actions surface, or challenge the first eligible nearby Sim here.", 160f,
+                DuelControlApi.GetStatus,
+                new FallbackAction("Challenge Nearby", ChallengeFirstEligible, delegate { return DuelControlApi.GetBasicState().CanStart && (DuelControlApi.GetBasicState().EligibleNames ?? new string[0]).Length > 0; }),
+                new FallbackAction("Stop Duel", DuelControlApi.TryStop, delegate { return DuelControlApi.GetBasicState().Active; }));
         }
+        private static bool ChallengeFirstEligible()
+        { string[] names = DuelControlApi.GetBasicState().EligibleNames ?? new string[0]; return names.Length > 0 && DuelControlApi.TryChallenge(names[0]); }
 
         private void OnSceneLoaded(Scene scene, LoadSceneMode mode)
         {
@@ -70,6 +78,7 @@ namespace ErenshorDuel
 
         private void Update()
         {
+            StandaloneFallbackUi.Tick(DuelUiReady());
             try
             {
                 if (_pendingControlStop) { _pendingControlStop = false; DuelController.Stop("Practice duel stopped from Suite Hub."); }
@@ -91,6 +100,7 @@ namespace ErenshorDuel
 
         private void OnDestroy()
         {
+            StandaloneFallbackUi.Dispose();
             _pendingControlChallenge = null; _pendingControlStop = false;
             DuelController.Shutdown();
             try { if (_harmony != null) _harmony.UnpatchSelf(); } catch { }
@@ -105,6 +115,12 @@ namespace ErenshorDuel
             DeepSimsCompatibility.Reset();
             CoopCompatibility.Reset();
             if (Instance == this) Instance = null;
+        }
+
+        private static bool DuelUiReady()
+        {
+            try { return !GameData.InCharSelect && !GameData.Zoning && GameData.PlayerControl != null && GameData.PlayerControl.Myself != null; }
+            catch { return false; }
         }
 
         internal void Chat(string message, string color)

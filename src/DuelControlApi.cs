@@ -1,4 +1,5 @@
 using System;
+using ForgottenRoads.StandaloneUi;
 
 namespace ErenshorDuel
 {
@@ -15,8 +16,8 @@ namespace ErenshorDuel
         public const int ApiVersion = 1;
         public const string ModuleId = "duel";
         public static bool IsAvailable { get { return ErenshorDuelPlugin.Instance != null; } }
-        public static bool HasDedicatedPanel { get { return false; } }
-        public static bool IsPanelOpen { get { return false; } }
+        public static bool HasDedicatedPanel { get { return true; } }
+        public static bool IsPanelOpen { get { return StandaloneFallbackUi.IsOpen; } }
         public static DuelControlState GetBasicState()
         {
             return new DuelControlState { Active = DuelController.Active, CanStart = DuelController.CanStartNewDuel, Status = DuelController.Status(), EligibleNames = DuelController.EligibleNames() };
@@ -39,7 +40,7 @@ namespace ErenshorDuel
             if (!DuelController.Active) return true;
             return p.RequestControlStop();
         }
-        public static bool OpenPanel() { return false; }
-        public static bool ClosePanel() { return false; }
+        public static bool OpenPanel() { return StandaloneFallbackUi.Open(); }
+        public static bool ClosePanel() { return StandaloneFallbackUi.Close(); }
     }
 }

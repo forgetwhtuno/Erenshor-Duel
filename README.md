@@ -86,8 +86,8 @@ cycle.
 - **[Erenshor COOP](https://github.com/MizukiBelhi/ErenshorCoop) by MizukiBelhi** is a technical
   reference and compatibility target for remote-human and networked-Sim detection.
 
-This project was developed with substantial AI-assisted coding support, guided by design, testing,
-playtesting, audits, and iteration. It is an unofficial community mod and is not affiliated with
+This project is guided by design, testing, playtesting, audits, and iteration. It is an unofficial
+community mod and is not affiliated with
 or endorsed by Erenshor's developer.
 
 
@@ -95,6 +95,6 @@ or endorsed by Erenshor's developer.
 
 Forgotten Roads Hub is **optional**. The mod exposes a versioned `DuelControlApi`/Aura surface without a Hub assembly reference or load-order dependency. The descriptor reports concise duel status plus an eligible-local-candidate count. Its action transport remains exactly the authoritative operations already supported by the ControlApi: `challenge` with an explicit Sim-name argument and `stop`.
 
-Practice Duels intentionally has no dedicated module panel or standalone launcher; `/eduel` and existing contextual integrations remain standalone. Remote COOP humans and unrelated actors remain excluded by the same eligibility path used outside Hub.
+Practice Duels keeps combat UI small, but the shared retained fallback entry point provides mouse discoverability when Forgotten Roads Hub is absent/unavailable and hides while a healthy Hub owns primary access. `/eduel` remains a compatibility control. Remote COOP humans and unrelated actors remain excluded by the same eligibility path used outside Hub.
 
 The current Suite Hub renderer can transport two-argument actions but does not yet render arbitrary argument-entry/action controls on a module page. Therefore the Duel provider advertises `challenge(name)`/`stop` correctly, but this workstream does not invent a fake target selector or modify Hub to surface them as buttons.
