@@ -4,7 +4,10 @@ namespace ErenshorDuel
     {
         internal static string RunAll()
         {
-            string result = DuelChallengePolicy.RunSelfTests();
+            string result = DuelLifecyclePolicy.RunSelfTests();
+            if (!result.StartsWith("PASS")) return result;
+
+            result = DuelChallengePolicy.RunSelfTests();
             if (!result.StartsWith("PASS")) return result;
 
             result = DuelEligibilityPolicy.RunSelfTests();

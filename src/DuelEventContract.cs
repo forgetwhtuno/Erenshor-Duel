@@ -140,6 +140,8 @@ namespace ErenshorDuel
                 return "camp";
             if (s.IndexOf("distance", StringComparison.Ordinal) >= 0 || r.IndexOf("too far", StringComparison.Ordinal) >= 0)
                 return "distance";
+            if (s.IndexOf("partyscope", StringComparison.Ordinal) >= 0 || r.IndexOf("party membership changed", StringComparison.Ordinal) >= 0)
+                return "party_scope_changed";
             if (s.IndexOf("participant", StringComparison.Ordinal) >= 0 || r.IndexOf("no longer available", StringComparison.Ordinal) >= 0)
                 return "participant_unavailable";
             if (s.IndexOf("exception", StringComparison.Ordinal) >= 0 || s.IndexOf("npcprocguard", StringComparison.Ordinal) >= 0 ||
@@ -184,6 +186,7 @@ namespace ErenshorDuel
 
             if (CancellationToken("Tick.AttackingPlayer", "verified outside attacker entered party combat") != "hostile_interruption" ||
                 CancellationToken("Tick.Camp", "camp mode is active") != "camp" ||
+                CancellationToken("Tick.PartyScope", "party membership changed") != "party_scope_changed" ||
                 CancellationToken("Stop.Fallback", "Practice duel stopped.") != "manual_stop")
                 return "FAIL events: cancellation tokens";
 

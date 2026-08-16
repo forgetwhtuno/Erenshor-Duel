@@ -6,11 +6,13 @@ using UnityEngine.SceneManagement;
 
 namespace ErenshorDuel
 {
-    [LunarisPlugin("forgetwhtuno.erenshor.practice-duels", "0.4.0", "forgetwhtuno",
+    [LunarisPlugin(PluginGuid, PluginVersion, "forgetwhtuno",
         "Friendly, non-lethal simulated sparring between the player and a local Sim, or between two local Sims while the player watches, using virtualized health inside a bounded duel.")]
     [LunarisPermission(LunarisPermission.Reflection | LunarisPermission.Harmony)]
     public sealed class ErenshorDuelPlugin : LunarisPlugin
     {
+        internal const string PluginGuid = "forgetwhtuno.erenshor.practice-duels";
+        internal const string PluginVersion = "0.4.1";
         internal static ErenshorDuelPlugin Instance;
         private Harmony _harmony;
         private static bool _sceneHooksInstalled;
@@ -21,7 +23,7 @@ namespace ErenshorDuel
         private void Awake()
         {
             Instance = this;
-            _harmony = new Harmony("forgetwhtuno.erenshor.practice-duels");
+            _harmony = new Harmony(PluginGuid);
             _harmony.PatchAll();
             DeepSimsCompatibility.Initialize();
             CoopCompatibility.Refresh();
@@ -41,17 +43,23 @@ namespace ErenshorDuel
             }
             catch (Exception ex) { Logging.LogError("Duel Suite Aura provider setup failed: " + ex); }
 
-            Logging.LogInfo("Practice Duels loaded. Use /eduel <SimName>, /eduel <Sim A> vs <Sim B>, /eduel nearby, /eduel status, /eduel diag, /eduel selftest, or /eduel stop.");
+            Logging.LogInfo("Practice Duels " + PluginVersion + " loaded. Use /eduel <SimName>, /eduel <Sim A> vs <Sim B>, /eduel nearby, /eduel status, /eduel diag, /eduel selftest, or /eduel stop.");
         }
 
         private void OnSceneLoaded(Scene scene, LoadSceneMode mode)
         {
+            // A queued Hub challenge is actor-name based and must never survive a zone boundary.
+            _pendingControlChallenge = null;
             DuelController.HandleSceneTransition();
             DeepSimsCompatibility.Refresh();
             CoopCompatibility.Refresh();
         }
 
-        private void OnSceneUnloaded(Scene scene) { DuelController.HandleSceneTransition(); }
+        private void OnSceneUnloaded(Scene scene)
+        {
+            _pendingControlChallenge = null;
+            DuelController.HandleSceneTransition();
+        }
 
         private void OnApplicationQuit()
         {
@@ -69,7 +77,7 @@ namespace ErenshorDuel
                 {
                     string requested = _pendingControlChallenge; _pendingControlChallenge = null;
                     bool ambiguous; SimPlayer sim = DuelController.FindSim(requested, out ambiguous);
-                    if (!ambiguous && sim != null && !DuelController.Active) DuelController.Start(sim);
+                    if (!ambiguous && sim != null && DuelController.CanStartNewDuel) DuelController.Start(sim);
                 }
                 DuelController.Tick();
             }
@@ -107,14 +115,16 @@ namespace ErenshorDuel
 
         internal bool RequestControlChallenge(string simName)
         {
-            if (string.IsNullOrWhiteSpace(simName) || DuelController.Active) return false;
+            if (string.IsNullOrWhiteSpace(simName) || !DuelController.CanStartNewDuel) return false;
             _pendingControlChallenge = simName.Trim(); _pendingControlStop = false; return true;
         }
         internal bool RequestControlStop() { _pendingControlStop = true; _pendingControlChallenge = null; return true; }
 
         internal void Diagnostic(string message)
         {
-            Logging.LogWarning(message);
+            // Duel lifecycle diagnostics are expected observability, not warning conditions.
+            // Exceptions and actual patch failures continue to use error logging at their call sites.
+            Logging.LogDebug(message);
         }
 
         internal bool Handle(TypeText typeText, string raw)

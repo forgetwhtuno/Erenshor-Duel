@@ -1,20 +1,17 @@
-# Erenshor Practice Duels 0.4.0
+# Erenshor Practice Duels 0.4.1
 
 Erenshor Practice Duels provides friendly, non-lethal simulated sparring between the player and a
 local Sim, or between two local Sims while the player watches. It uses Erenshor's native combat
 calculations where the installed paths have been verified, while virtualizing duel health so a
 practice match does not become ordinary gameplay combat.
 
-## Status: native Lunaris migration candidate
+## Status: playable-state release candidate
 
-This version has been migrated off BepInEx 5 onto native Lunaris. This is a
-loader/logging/lifecycle migration only — no duel eligibility, safety-gate, virtual-health,
-native-damage-routing, third-party-isolation, or cleanup behavior changed; every Harmony patch
-target has been re-verified against the currently installed `Assembly-CSharp.dll`, and the full
-deterministic self-test suite (`tests/RUN_TESTS.ps1`) still passes. **Live in-game verification
-under Lunaris — including hot unload/reload during an active duel — has not yet been done.** A
-legacy BepInEx release remains available in this repository's Git history for anyone still on
-BepInEx.
+The combat boundary remains native-adjacent: Erenshor computes admitted duel damage, Duel contains the result in virtual health, and terminal cleanup restores only state Duel still owns. Lifecycle is explicit: `Idle -> Preparing -> Countdown -> Active -> Cleaning -> Idle`. `Cleaning` is a real two-second teardown gate, so another challenge cannot overlap a still-running target/aggro scrub.
+
+Terminal restore is ownership-aware. If native gameplay selects a new unrelated player/NPC target during teardown, Duel does not replay an older target over it, and the post-duel autoattack scrub releases ownership immediately. Party-scope changes, participant invalidation, zoning, and direct outside hostile ingress cancel deterministically. Idle shutdown remains quiet.
+
+The deterministic self-test suite and installed-reference build pass against the current local Erenshor/Lunaris installation. Version 0.4.1 also routes both normal and emergency terminal paths through the same party Guard/follow restoration helper. Full live verification remains required for winner, timeout, manual stop, immediate repeat, hostile interruption, participant invalidation, zoning, and unload/reload.
 
 ## What it does
 
@@ -25,12 +22,24 @@ BepInEx.
   virtual-health duel boundary; unsupported third-party actions fail closed.
 - Excludes remote COOP humans and network-owned Sims, and cancels safely for zoning, distance,
   camp activation, hostile interference, participant loss, manual stops, and internal errors.
-- Restores captured temporary combat state on teardown, including health, effects, targets, aggro,
-  pets, autoattack, and related temporary state where supported by the current source.
+- Restores captured temporary combat state on teardown, including health, effects, targets, aggro, pets, and related temporary state where supported by the current source. Restoration is ownership-aware: newer unrelated target/combat state is preserved instead of blindly overwritten by a pre-duel snapshot. A challenge is rejected if native autoattack evidence is unavailable or player autoattack was already active, so Duel never has to reconstruct a native attack loop that predates the practice match.
 
 Practice Duels grants no XP or loot, changes no faction, creates no real PvP, and does not make
 participants permanently hostile. Erenshor's existing AI remains responsible for combat behavior;
 this mod does not direct movement, targeting, attacks, spells, or healing decisions.
+
+## Duel lifecycle
+
+```text
+Idle
+  -> Preparing     challenge accepted; snapshots owned state
+  -> Countdown     acceptance/countdown presentation
+  -> Active        duel combat interception is admitted
+  -> Cleaning      real state restored; bounded stale target/aggro scrub
+  -> Idle          all duel and post-cleanup ownership released
+```
+
+Any terminal reason from Preparing, Countdown, or Active enters Cleaning. New challenges are rejected during Cleaning. Zone transitions, participant loss, party-scope changes, verified/direct outside combat, manual stop, unload, and shutdown all converge on the same terminal restoration boundary.
 
 ## Commands
 

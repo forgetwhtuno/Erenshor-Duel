@@ -6,6 +6,7 @@ namespace ErenshorDuel
     internal static class DeepSimsCompatibility
     {
         private const string CampmasterApiTypeName = "ErenshorCampmaster.CampmasterApi";
+        private const int SupportedCampmasterSchemaVersion = 3;
 
         private static bool _resolved;
         private static int _resolvedAssemblyCount;
@@ -161,6 +162,8 @@ namespace ErenshorDuel
                 return "FAIL compatibility: Campmaster API property detection";
             if (CampmasterApiShapeIsSupported(typeof(BadCampmasterApiFixture)))
                 return "FAIL compatibility: unsupported Campmaster API shape admitted";
+            if (CampmasterApiShapeIsSupported(typeof(FutureCampmasterApiFixture)))
+                return "FAIL compatibility: unknown Campmaster schema admitted";
             if (ShouldUseGenericFallback(true, true))
                 return "FAIL compatibility: structured event duplicated to generic fallback";
             if (!ShouldUseGenericFallback(true, false) || !ShouldUseGenericFallback(false, false))
@@ -170,22 +173,36 @@ namespace ErenshorDuel
 
         private sealed class CampmasterApiFixture
         {
+            public const int SchemaVersion = SupportedCampmasterSchemaVersion;
             public static bool IsHuntCampActive { get { return true; } }
             public static bool IsRelaxActive { get { return false; } }
         }
 
         private sealed class BadCampmasterApiFixture
         {
+            public const int SchemaVersion = SupportedCampmasterSchemaVersion;
             public static string IsHuntCampActive { get { return "yes"; } }
+        }
+
+        private sealed class FutureCampmasterApiFixture
+        {
+            public const int SchemaVersion = SupportedCampmasterSchemaVersion + 1;
+            public static bool IsHuntCampActive { get { return true; } }
+            public static bool IsRelaxActive { get { return false; } }
         }
 
         private static bool CampmasterApiShapeIsSupported(Type api)
         {
             if (api == null) return false;
             const BindingFlags staticPublic = BindingFlags.Public | BindingFlags.Static;
+            FieldInfo schema = api.GetField("SchemaVersion", staticPublic);
             PropertyInfo hunt = api.GetProperty("IsHuntCampActive", staticPublic);
             PropertyInfo relax = api.GetProperty("IsRelaxActive", staticPublic);
-            return hunt != null && hunt.PropertyType == typeof(bool) &&
+            if (schema == null || schema.FieldType != typeof(int)) return false;
+            int schemaVersion;
+            try { schemaVersion = (int)schema.GetValue(null); } catch { return false; }
+            return schemaVersion == SupportedCampmasterSchemaVersion &&
+                   hunt != null && hunt.PropertyType == typeof(bool) &&
                    (relax == null || relax.PropertyType == typeof(bool));
         }
 
