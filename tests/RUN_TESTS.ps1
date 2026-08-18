@@ -47,7 +47,7 @@ finally {
 # cleanup primitives. These complement the Unity-free lifecycle/safety policy assertions above.
 $plugin = Get-Content (Join-Path $ScriptRoot "..\src\ErenshorDuelPlugin.cs") -Raw
 $controller = Get-Content (Join-Path $ScriptRoot "..\src\DuelController.cs") -Raw
-if ($plugin -notmatch 'PluginVersion\s*=\s*"0\.4\.5"' -or $plugin -notmatch 'Practice Duels " \+ PluginVersion \+ " loaded') {
+if ($plugin -notmatch 'PluginVersion\s*=\s*"0\.4\.6"' -or $plugin -notmatch 'Practice Duels " \+ PluginVersion \+ " loaded') {
     throw "Duel RC guard failed: startup output is not exact-version identifiable."
 }
 $emergencyStart = $controller.IndexOf('private static void EmergencyCleanup', [StringComparison]::Ordinal)
@@ -186,7 +186,7 @@ Assert-Forensic ($semantics -match 'unrelated world combat must remain vanilla' 
 if ($forensicCases -ne 40) { throw "Duel forensic matrix count mismatch: $forensicCases / 40" }
 Write-Host ("Practice Duel forensic deterministic/source matrix: PASS (" + $forensicCases + "/40)") -ForegroundColor Green
 
-Write-Host "Practice Duel 0.4.5 damage/healing/source guards: PASS" -ForegroundColor Green
+Write-Host "Practice Duel 0.4.6 damage/healing/source guards: PASS" -ForegroundColor Green
 
 # Final combat-recovery matrix (task cases 1-23). These remain source/pure-policy
 # contracts; installed-reference build and live acceptance are separate gates.
