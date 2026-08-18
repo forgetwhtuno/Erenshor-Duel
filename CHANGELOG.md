@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.4.5 - targeted ordinary self-heal admission
+
+- Preserves the live-proven 0.4.4 scoped `Stats.ReduceHP` damage transaction unchanged.
+- Fixes ordinary single-target `Heal` spells such as Minor Healing when the opposing duelist remains selected. During Active only, if the exact duelist caster receives the exact opposing duelist as the `StartSpell` Stats argument, and the spell is a contained healing-only single-target shape, the Harmony prefix rewrites only that method argument to the caster's own Stats. `PlayerControl.CurrentTarget` is never changed.
+- The adaptation is deliberately not a generic beneficial retarget: area/group, summon, charm, proc, mixed damage/heal, and unknown utility shapes remain under the existing containment rules.
+- Native `CastSpell.StartSpell` still owns mana, cooldown, cast time, animation, and heal amount; existing `HealMe` capture translates the native self-heal into virtual Duel HP exactly once.
+- Declared `SelfOnly` / `ApplyToCaster` / `InflictOnSelf`, AoE/world-combat, lifesteal, protected-NPC, COOP, and cleanup behavior are preserved.
+
+
 ## 0.4.4 - scoped ReduceHP damage transaction restoration
 
 - Repairs the 0.4.3 instant-yield regression. The temporary synthetic HP-headroom transaction is removed from participant damage: Duel no longer assigns a massive temporary `CurrentHP` value and no longer derives virtual damage from a synthetic before/after HP delta.

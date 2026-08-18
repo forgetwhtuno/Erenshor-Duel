@@ -47,7 +47,7 @@ finally {
 # cleanup primitives. These complement the Unity-free lifecycle/safety policy assertions above.
 $plugin = Get-Content (Join-Path $ScriptRoot "..\src\ErenshorDuelPlugin.cs") -Raw
 $controller = Get-Content (Join-Path $ScriptRoot "..\src\DuelController.cs") -Raw
-if ($plugin -notmatch 'PluginVersion\s*=\s*"0\.4\.4"' -or $plugin -notmatch 'Practice Duels " \+ PluginVersion \+ " loaded') {
+if ($plugin -notmatch 'PluginVersion\s*=\s*"0\.4\.5"' -or $plugin -notmatch 'Practice Duels " \+ PluginVersion \+ " loaded') {
     throw "Duel RC guard failed: startup output is not exact-version identifiable."
 }
 $emergencyStart = $controller.IndexOf('private static void EmergencyCleanup', [StringComparison]::Ordinal)
@@ -68,6 +68,7 @@ if ($controller -notmatch 'CancelForSceneMismatch' -or $controller -notmatch '!P
     throw "Duel RC guard failed: zone/invalid/timeout/repeat cleanup coverage changed."
 }
 $semantics = Get-Content (Join-Path $ScriptRoot "..\src\DuelCombatSemanticsPolicy.cs") -Raw
+$spellPolicy = Get-Content (Join-Path $ScriptRoot "..\src\DuelSpellAdmissionPolicy.cs") -Raw
 if ($controller -notmatch 'CaptureNativeReduceHp' -or $controller -match 'ObserveNativeReduceHp' -or
     $controller -match 'CurrentHP\s*=\s*int\.MaxValue' -or $controller -match 'NativeDamageHeadroom' -or
     $semantics -match 'NativeDamageHeadroom' -or $semantics -match 'EffectiveNativeDamage') {
@@ -106,6 +107,17 @@ if ($controller -notmatch 'DeclaresSelfApplication\(spell\)' -or
     $controller -notmatch 'IsSelfCast\(targetCharacter == casterCharacter, declaresSelfApplication\)') {
     throw "Duel self-cast guard failed: opponent-selected SelfOnly/ApplyToCaster/InflictOnSelf repair regressed."
 }
+if ($controller -notmatch 'TryAdaptOpponentHealToSelf' -or
+    $controller -notmatch 'ref Stats target' -or
+    ($controller -notmatch 'target = casterCharacter\.MyStats' -and $controller -notmatch 'target = selfStats') -or
+    $controller -notmatch 'currentTargetPreserved=true' -or
+    $spellPolicy -notmatch 'CanAdaptOpponentHealToSelf') {
+    throw "Duel targeted-heal guard failed: narrow opponent-selected self-heal adaptation missing."
+}
+if ($controller -match 'GameData\.PlayerControl\.CurrentTarget\s*=\s*_player' -or
+    $controller -match 'GameData\.PlayerControl\.CurrentTarget\s*=\s*casterCharacter') {
+    throw "Duel targeted-heal guard failed: global CurrentTarget mutation introduced."
+}
 if ($controller -notmatch 'hostile_world_real_offense' -or
     $controller -notmatch 'authority=real_world' -or
     $controller -notmatch 'worldDamagePreserved=true' -or
@@ -119,7 +131,6 @@ if ($controller -notmatch 'PreflightAreaSpell' -or $controller -notmatch 'hostil
 # Forensic regression matrix from the 0.4.4 damage-transaction repair brief. These are
 # deterministic source/pure-policy contracts; live native behavior remains a separate release gate.
 $safety = Get-Content (Join-Path $ScriptRoot "..\src\DuelSafetyPolicy.cs") -Raw
-$spellPolicy = Get-Content (Join-Path $ScriptRoot "..\src\DuelSpellAdmissionPolicy.cs") -Raw
 $lifecycle = Get-Content (Join-Path $ScriptRoot "..\src\DuelLifecyclePolicy.cs") -Raw
 $forensicCases = 0
 function Assert-Forensic([bool]$condition, [string]$name) {
@@ -143,13 +154,13 @@ Assert-Forensic ($semantics -match 'EffectiveCapturedDamage\(true, 58, 218\) != 
 Assert-Forensic ($semantics -match 'ordinary/world/wrong-target ReduceHP must remain native') '14 ordinary non-Duel ReduceHP untouched'
 Assert-Forensic ($semantics -match 'hostile world -> duelist must stay real') '15 hostile world -> duelist is real'
 Assert-Forensic ($semantics -match 'duelist -> hostile world must stay real') '16 duelist -> hostile world is real'
-Assert-Forensic ($spellPolicy -match 'SelfOnly heal with opponent targeted must be a self-cast') '17 SelfOnly with opponent selected'
+Assert-Forensic ($spellPolicy -match 'SelfOnly heal with opponent targeted must be a self-cast' -and $spellPolicy -match 'ordinary Heal must adapt to self') '17 Minor Healing/SelfOnly with opponent selected' 
 Assert-Forensic ($spellPolicy -match 'ApplyToCaster spell with opponent targeted must be a self-cast') '18 ApplyToCaster with opponent selected'
 Assert-Forensic ($spellPolicy -match 'InflictOnSelf spell with opponent targeted must be a self-cast') '19 InflictOnSelf with opponent selected'
 Assert-Forensic ($spellPolicy -match 'beneficial spell genuinely aimed at opponent must not become a self-cast') '20 opponent-beneficial spell not promoted to self'
 Assert-Forensic ($spellPolicy -match 'group-effect self spell must remain blocked' -and $spellPolicy -match 'pet summon must remain blocked' -and $spellPolicy -match 'charm must remain blocked') '21 unsafe self/group/pet/charm remains contained'
 Assert-Forensic ($controller -match 'FinishHeal' -and $controller -match '_playerHp \+ gained' -and $controller -match '_simHp \+ gained') '22 self-heal updates virtual HP once'
-Assert-Forensic ($controller -match 'BeginSpellStart' -and $controller -match 'FinishSpellStart' -and $controller -match 'resourceCommitted=' -and $controller -notmatch 'CurrentMana\s*[-+*/]?=') '23 allowed self-heal leaves native resource/cooldown ownership'
+Assert-Forensic ($controller -match 'BeginSpellStart' -and $controller -match 'FinishSpellStart' -and $controller -match 'resourceCommitted=' -and ($controller -match 'target = casterCharacter\.MyStats' -or $controller -match 'target = selfStats') -and $controller -notmatch 'CurrentMana\s*[-+*/]?=') '23 allowed self-heal keeps native resource/cooldown and arg-only retarget' 
 Assert-Forensic ($controller -match 'NPC\), "CheckHeals"' -or $controller -match 'CheckHealsRaid') '24 Sim native self-heal evaluation remains hooked/admissible'
 Assert-Forensic ($spellPolicy -match 'offensive AoE should be admissible with per-target containment') '25 clean offensive AoE allowed'
 Assert-Forensic ($controller -match 'hostileWorldAllowed=true') '26 offensive AoE permits hostile world actor'
@@ -171,4 +182,39 @@ Assert-Forensic ($semantics -match 'unrelated world combat must remain vanilla' 
 if ($forensicCases -ne 40) { throw "Duel forensic matrix count mismatch: $forensicCases / 40" }
 Write-Host ("Practice Duel forensic deterministic/source matrix: PASS (" + $forensicCases + "/40)") -ForegroundColor Green
 
-Write-Host "Practice Duel 0.4.4 damage-transaction/source guards: PASS" -ForegroundColor Green
+Write-Host "Practice Duel 0.4.5 damage/healing/source guards: PASS" -ForegroundColor Green
+
+# Final combat-recovery matrix (task cases 1-23). These remain source/pure-policy
+# contracts; installed-reference build and live acceptance are separate gates.
+$finalRecoveryCases = 0
+function Assert-FinalRecovery([bool]$condition, [string]$name) {
+    if (-not $condition) { throw ("Duel final recovery matrix failed: " + $name) }
+    $script:finalRecoveryCases++
+}
+Assert-FinalRecovery ($controller -match 'CaptureNativeReduceHp' -and $controller -match 'CapturedReduceHpDamage\s*=\s*damage') '01 scoped ReduceHP capture preserved'
+Assert-FinalRecovery ($controller -notmatch 'CurrentHP\s*=\s*int\.MaxValue' -and $semantics -notmatch 'NativeDamageHeadroom') '02 no synthetic HP headroom'
+Assert-FinalRecovery ($controller -match 'DuelPhysicalDamagePatch' -and $controller -match 'target == _sim') '03 player melee -> Sim virtual'
+Assert-FinalRecovery ($controller -match 'DuelPhysicalDamagePatch' -and $controller -match 'target == _player') '04 Sim melee -> player virtual'
+Assert-FinalRecovery ($controller -match 'DuelMagicDamagePatch' -and $controller -match 'PrepareNativeDamage') '05 direct spell virtual damage'
+Assert-FinalRecovery ($safety -match 'ReachedYieldThreshold' -and $controller -match 'DuelSafetyPolicy\.ReachedYieldThreshold') '06 legitimate yield threshold only'
+Assert-FinalRecovery ($spellPolicy -match 'ordinary Heal must adapt to self' -and $controller -match 'target = selfStats') '07 Minor Healing with opponent targeted adapts to self'
+Assert-FinalRecovery ($controller -match 'originalTarget=' -and $controller -match 'resolvedTarget=' -and $controller -match 'target = selfStats') '08 adapted Minor Healing cannot remain aimed at opponent'
+Assert-FinalRecovery ($controller -match 'resourceCommitted=' -and $controller -match 'cooldownCommitted=unavailable_in_supplied_api' -and $controller -notmatch 'CurrentMana\s*[-+*/]?=') '09 native mana/cooldown authority preserved'
+Assert-FinalRecovery ($spellPolicy -match 'SelfOnly heal with opponent targeted must be a self-cast') '10 SelfOnly with opponent targeted'
+Assert-FinalRecovery ($spellPolicy -match 'ApplyToCaster spell with opponent targeted must be a self-cast') '11 ApplyToCaster with opponent targeted'
+Assert-FinalRecovery ($spellPolicy -match 'InflictOnSelf spell with opponent targeted must be a self-cast') '12 InflictOnSelf with opponent targeted'
+Assert-FinalRecovery ($controller -match 'DuelMagicDamagePatch' -and $controller -match 'FinishHeal' -and $controller -match 'virtual_heal') '13 lifesteal/damage+heal routes remain native-adjacent and virtual once'
+Assert-FinalRecovery ($controller -match '\[HarmonyPatch\(typeof\(NPC\), "CheckHeals"\)\]' -and $controller -match 'CheckHealsRaid') '14 Sim native self-heal evaluation retained'
+Assert-FinalRecovery ($controller -match 'third_party_heal_blocked' -and $controller -match 'IsFriendlyPartyClass') '15 unrelated outside-friendly heal remains blocked'
+Assert-FinalRecovery ($spellPolicy -match 'offensive AoE should be admissible with per-target containment') '16 participant-only offensive AoE admitted'
+Assert-FinalRecovery ($controller -match 'hostileWorldAllowed=true') '17 hostile world actor in AoE does not block cast'
+Assert-FinalRecovery ($controller -match 'hostile_world_real_offense' -and $controller -match 'authority=real_world') '18 hostile world target takes real native damage'
+Assert-FinalRecovery ($controller -match 'WorldReal = true' -and $controller -match 'worldDamagePreserved=true') '19 hostile retaliation remains real'
+Assert-FinalRecovery ($controller -match 'ProtectedNonParticipant' -and $controller -match 'NotifyUnsafeAreaBystander') '20 protected neutral actor remains safe'
+Assert-FinalRecovery ($lifecycle -match 'repeated duel cycle' -and $controller -match 'PostDuel') '21 second consecutive Duel cleanup path'
+Assert-FinalRecovery ($controller -match 'if \(!Active \|\| target == null\) return true;' -and $controller -match 'DuelSimpleHealPatch') '22 post-Duel vanilla healing'
+Assert-FinalRecovery ($controller -match 'if \(!Active\) return true;' -and $controller -match 'DuelPhysicalDamagePatch') '23 post-Duel vanilla damage'
+
+if ($finalRecoveryCases -ne 23) { throw "Duel final recovery matrix count mismatch: $finalRecoveryCases / 23" }
+Write-Host ("Practice Duel final forensic recovery source matrix: PASS (" + $finalRecoveryCases + "/23)") -ForegroundColor Green
+

@@ -72,8 +72,39 @@ namespace ErenshorDuel
                    IsAreaStructurallyContainable(petSummon, charmTarget, hasProc);
         }
 
+
+
+        // Narrow Practice-Duel-only adaptation for ordinary single-target Heal spells whose hotbar
+        // call carries the currently selected opposing duelist as the Stats argument. This is not
+        // a general beneficial-spell retarget: it only admits a proven healing payload, only from an
+        // active duelist to the exact opponent argument, and only when the shape cannot escape to
+        // group/pet/charm/proc/area targets.
+        internal static bool CanAdaptOpponentHealToSelf(bool duelActive, bool casterIsParticipant,
+            bool passedTargetIsOpponent, bool healType, int targetHealing, int targetDamage,
+            bool groupEffect, bool isAe, bool isPbae, bool petSummon, bool charmTarget, bool hasProc)
+        {
+            if (!duelActive || !casterIsParticipant || !passedTargetIsOpponent) return false;
+            if (!(healType || targetHealing > 0) || targetDamage > 0) return false;
+            if (groupEffect || isAe || isPbae || petSummon || charmTarget || hasProc) return false;
+            return true;
+        }
+
         internal static string RunSelfTests()
         {
+            // Ordinary Heal spells do not necessarily declare SelfOnly/ApplyToCaster/InflictOnSelf.
+            // During an active duel, the exact opponent-target hotbar shape may be narrowly adapted
+            // to caster Stats without changing PlayerControl.CurrentTarget.
+            if (!CanAdaptOpponentHealToSelf(true, true, true, true, 10, 0, false, false, false, false, false, false))
+                return "FAIL opponent-targeted ordinary Heal must adapt to self";
+            if (CanAdaptOpponentHealToSelf(true, true, true, false, 0, 0, false, false, false, false, false, false))
+                return "FAIL generic beneficial utility must not auto-retarget";
+            if (CanAdaptOpponentHealToSelf(true, true, true, true, 10, 1, false, false, false, false, false, false))
+                return "FAIL mixed damage/heal payload must not auto-retarget";
+            if (CanAdaptOpponentHealToSelf(true, true, true, true, 10, 0, true, false, false, false, false, false))
+                return "FAIL group heal must not use single-target adaptation";
+            if (CanAdaptOpponentHealToSelf(true, true, true, true, 10, 0, false, true, false, false, false, false))
+                return "FAIL AE heal must not use single-target adaptation";
+
             // --- DeclaresSelfApplication -------------------------------------------------------
             if (!DeclaresSelfApplication(true, false, false)) return "FAIL SelfOnly declares self-application";
             if (!DeclaresSelfApplication(false, true, false)) return "FAIL ApplyToCaster declares self-application";

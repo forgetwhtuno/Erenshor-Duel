@@ -100,9 +100,9 @@ namespace ErenshorDuel
         [ThreadStatic]
         private static Character _effectTickOwner;
         // Set only while one of Erenshor's ordinary damage methods is resolving a contained edge.
-        // Duel-participant hits run natively against temporary non-lethal HP headroom and are
-        // measured by delta. Hostile-world hits temporarily expose the real-world HP ledger so they
-        // remain genuine native combat, then virtual HP is remirrored if the duelist survives.
+        // Duel-participant hits let native Erenshor calculate mitigation/etc.; the exact in-flight
+        // Stats.ReduceHP call is captured/suppressed and that final effective amount is applied once
+        // to virtual HP. Hostile-world hits use the separate real-world ledger and remain native.
         [ThreadStatic]
         private static NativeDamageState _nativeDamageInFlight;
         [ThreadStatic]
@@ -2060,10 +2060,27 @@ namespace ErenshorDuel
             internal string Source;
         }
 
-        internal static bool BeginSpellStart(CastSpell caster, Spell spell, Stats target, ref bool result,
+        internal static bool BeginSpellStart(CastSpell caster, Spell spell, ref Stats target, ref bool result,
             string eventSource, ref SpellStartState state)
         {
+            Stats originalTarget = target;
+            // The product adaptation is intentionally limited to the ordinary StartSpell overloads
+            // reached by normal cast/hotbar flow. Proc/no-animation callbacks keep their native target
+            // semantics and are contained by the existing per-effect source/target guards.
+            bool directCastEntry = !string.IsNullOrEmpty(eventSource) &&
+                eventSource.StartsWith("Harmony.CastSpell.StartSpell/", StringComparison.Ordinal);
+            bool adaptedToSelf = directCastEntry && TryAdaptOpponentHealToSelf(caster, spell, ref target);
             bool allow = AllowSpellStart(caster, spell, target, ref result, eventSource);
+            if (Active && adaptedToSelf)
+            {
+                DiagnosticRecord("spell_target_adaptation spell=" + SafeLabel(spell == null ? null : spell.SpellName) +
+                    " originalTarget=" + DamageTargetRole(originalTarget == null ? null : originalTarget.Myself) +
+                    " resolvedTarget=" + DamageTargetRole(target == null ? null : target.Myself) +
+                    " currentTargetPreserved=true mode=single_target_heal_to_self");
+                _lastSpellAdmission += " targetAdaptedToSelf=true originalTargetArg=" +
+                    DamageTargetRole(originalTarget == null ? null : originalTarget.Myself) +
+                    " resolvedTargetArg=" + DamageTargetRole(target == null ? null : target.Myself);
+            }
             if (Active && caster != null && IsDuelParticipantClass(Classify(caster.MyChar)))
             {
                 Stats stats = null;
@@ -2100,6 +2117,43 @@ namespace ErenshorDuel
                 " resourceCommitted=" + resourceCommitted +
                 " cooldownCommitted=unavailable_in_supplied_api";
             DiagnosticRecord("spell_commit " + _lastSpellAdmission);
+        }
+
+        private static bool TryAdaptOpponentHealToSelf(CastSpell caster, Spell spell, ref Stats target)
+        {
+            if (!Active || _state != DuelLifecycleState.Active || caster == null || spell == null) return false;
+            Character casterCharacter = null;
+            Character targetCharacter = null;
+            try { casterCharacter = caster.MyChar; } catch { }
+            try { targetCharacter = target == null ? null : target.Myself; } catch { }
+            if (!IsDuelParticipantClass(Classify(casterCharacter))) return false;
+            Character opponent = casterCharacter == _player ? _sim : casterCharacter == _sim ? _player : null;
+            if (opponent == null || targetCharacter != opponent) return false;
+
+            bool healType = false, group = false, ae = false, pbae = false, pet = false, charm = false, proc = false;
+            int targetHealing = 0, targetDamage = 0;
+            try { healType = spell.Type == Spell.SpellType.Heal; } catch { }
+            try { targetHealing = spell.TargetHealing; } catch { }
+            try { targetDamage = spell.TargetDamage; } catch { }
+            try { group = spell.GroupEffect; } catch { }
+            try { ae = spell.Type == Spell.SpellType.AE; } catch { }
+            try { pbae = spell.Type == Spell.SpellType.PBAE; } catch { }
+            try { pet = spell.PetToSummon != null; } catch { }
+            try { charm = spell.CharmTarget; } catch { }
+            try { proc = spell.AddProc != null; } catch { }
+
+            bool adapt = DuelSpellAdmissionPolicy.CanAdaptOpponentHealToSelf(
+                true, true, true, healType, targetHealing, targetDamage,
+                group, ae, pbae, pet, charm, proc);
+            if (!adapt) return false;
+            try
+            {
+                Stats selfStats = casterCharacter.MyStats;
+                if (selfStats == null || selfStats.Myself != casterCharacter) return false;
+                target = selfStats;
+                return true;
+            }
+            catch { return false; }
         }
 
         internal static bool AllowSpellStart(CastSpell caster, Spell spell, Stats target, ref bool result, string eventSource)
@@ -4227,9 +4281,9 @@ namespace ErenshorDuel
     internal static class DuelPartySpellStartPatch
     {
         [HarmonyPrefix]
-        private static bool Prefix(CastSpell __instance, Spell __0, Stats __1, ref bool __result, ref DuelController.SpellStartState __state)
+        private static bool Prefix(CastSpell __instance, Spell __0, ref Stats __1, ref bool __result, ref DuelController.SpellStartState __state)
         {
-            return DuelController.BeginSpellStart(__instance, __0, __1, ref __result, "Harmony.CastSpell.StartSpell/2", ref __state);
+            return DuelController.BeginSpellStart(__instance, __0, ref __1, ref __result, "Harmony.CastSpell.StartSpell/2", ref __state);
         }
 
         [HarmonyPostfix]
@@ -4250,9 +4304,9 @@ namespace ErenshorDuel
     internal static class DuelSpellStartTimedPatch
     {
         [HarmonyPrefix]
-        private static bool Prefix(CastSpell __instance, Spell __0, Stats __1, ref bool __result, ref DuelController.SpellStartState __state)
+        private static bool Prefix(CastSpell __instance, Spell __0, ref Stats __1, ref bool __result, ref DuelController.SpellStartState __state)
         {
-            return DuelController.BeginSpellStart(__instance, __0, __1, ref __result, "Harmony.CastSpell.StartSpell/3", ref __state);
+            return DuelController.BeginSpellStart(__instance, __0, ref __1, ref __result, "Harmony.CastSpell.StartSpell/3", ref __state);
         }
 
         [HarmonyPostfix]
@@ -4273,9 +4327,9 @@ namespace ErenshorDuel
     internal static class DuelSpellStartResonatePatch
     {
         [HarmonyPrefix]
-        private static bool Prefix(CastSpell __instance, Spell __0, Stats __1, ref bool __result, ref DuelController.SpellStartState __state)
+        private static bool Prefix(CastSpell __instance, Spell __0, ref Stats __1, ref bool __result, ref DuelController.SpellStartState __state)
         {
-            return DuelController.BeginSpellStart(__instance, __0, __1, ref __result, "Harmony.CastSpell.StartSpell/4", ref __state);
+            return DuelController.BeginSpellStart(__instance, __0, ref __1, ref __result, "Harmony.CastSpell.StartSpell/4", ref __state);
         }
 
         [HarmonyPostfix]
@@ -4296,9 +4350,9 @@ namespace ErenshorDuel
     internal static class DuelSpellStartScaledPatch
     {
         [HarmonyPrefix]
-        private static bool Prefix(CastSpell __instance, Spell __0, Stats __1, ref bool __result, ref DuelController.SpellStartState __state)
+        private static bool Prefix(CastSpell __instance, Spell __0, ref Stats __1, ref bool __result, ref DuelController.SpellStartState __state)
         {
-            return DuelController.BeginSpellStart(__instance, __0, __1, ref __result, "Harmony.CastSpell.StartSpell/5", ref __state);
+            return DuelController.BeginSpellStart(__instance, __0, ref __1, ref __result, "Harmony.CastSpell.StartSpell/5", ref __state);
         }
 
         [HarmonyPostfix]
@@ -4319,9 +4373,9 @@ namespace ErenshorDuel
     internal static class DuelSpellProcStartPatch
     {
         [HarmonyPrefix]
-        private static bool Prefix(CastSpell __instance, Spell __0, Stats __1, ref bool __result, ref DuelController.SpellStartState __state)
+        private static bool Prefix(CastSpell __instance, Spell __0, ref Stats __1, ref bool __result, ref DuelController.SpellStartState __state)
         {
-            return DuelController.BeginSpellStart(__instance, __0, __1, ref __result, "Harmony.CastSpell.StartSpellFromProc", ref __state);
+            return DuelController.BeginSpellStart(__instance, __0, ref __1, ref __result, "Harmony.CastSpell.StartSpellFromProc", ref __state);
         }
 
         [HarmonyPostfix]
@@ -4342,9 +4396,9 @@ namespace ErenshorDuel
     internal static class DuelSpellNoAnimPatch
     {
         [HarmonyPrefix]
-        private static bool Prefix(CastSpell __instance, Spell __0, Stats __1, ref bool __result, ref DuelController.SpellStartState __state)
+        private static bool Prefix(CastSpell __instance, Spell __0, ref Stats __1, ref bool __result, ref DuelController.SpellStartState __state)
         {
-            return DuelController.BeginSpellStart(__instance, __0, __1, ref __result, "Harmony.CastSpell.StartSpellNoAnim", ref __state);
+            return DuelController.BeginSpellStart(__instance, __0, ref __1, ref __result, "Harmony.CastSpell.StartSpellNoAnim", ref __state);
         }
 
         [HarmonyPostfix]

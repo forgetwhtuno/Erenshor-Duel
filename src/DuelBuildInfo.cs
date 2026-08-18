@@ -4,6 +4,6 @@ namespace ErenshorDuel
     // development build even before a commit exists.
     internal static class DuelBuildInfo
     {
-        internal const string Id = "0.4.4-rc-reducehp-capture";
+        internal const string Id = "0.4.5-rc-targeted-self-heal";
     }
 }

@@ -13,7 +13,7 @@ namespace ErenshorDuel
     public sealed class ErenshorDuelPlugin : LunarisPlugin
     {
         internal const string PluginGuid = "forgetwhtuno.erenshor.practice-duels";
-        internal const string PluginVersion = "0.4.4";
+        internal const string PluginVersion = "0.4.5";
         internal static ErenshorDuelPlugin Instance;
         private Harmony _harmony;
         private bool _runtimeHooksReady;
