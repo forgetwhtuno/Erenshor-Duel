@@ -298,7 +298,7 @@ namespace ErenshorDuel
                 EmergencyCleanup("Start.StateTransition");
                 return;
             }
-            Diagnostic("duel_start build=" + DuelBuildInfo.Id +
+            DiagnosticRecord("duel_start build=" + DuelBuildInfo.Id +
                 " playerReal=" + _playerRealHp + "/" + _playerMax +
                 " opponentReal=" + _simRealHp + "/" + _simMax +
                 " playerVirtual=" + _playerHp + "/" + _playerMax +
@@ -462,7 +462,7 @@ namespace ErenshorDuel
             bool autoAttackBefore = ReadPlayerAutoattack();
             string targetBefore = DescribeActor(GameData.PlayerControl == null ? null : GameData.PlayerControl.CurrentTarget);
             bool externalCombatPresent = HasUnsafeRealCombat(_player, _sim, _simNpc);
-            Diagnostic("duel_terminal reason=" + SafeLabel(reason) + " active=" + wasActive +
+            DiagnosticRecord("duel_terminal reason=" + SafeLabel(reason) + " active=" + wasActive +
                 " cleanup=" + hadDuelState + " autoAttackBefore=" + autoAttackBefore +
                 " targetBefore=" + targetBefore + " externalCombatPresent=" + externalCombatPresent);
             if (hadDuelState) BeginPostDuelAttackCleanup();
@@ -586,7 +586,7 @@ namespace ErenshorDuel
             bool autoAttackAfter = ReadPlayerAutoattack();
             ClearSessionState();
             RunPostDuelAttackCleanup();
-            Diagnostic("cleanup autoAttackBefore=" + autoAttackBefore + " autoAttackAfter=" + autoAttackAfter +
+            DiagnosticRecord("cleanup autoAttackBefore=" + autoAttackBefore + " autoAttackAfter=" + autoAttackAfter +
                 " targetBefore=" + targetBefore + " targetAfter=" + targetAfter +
                 " externalCombatPresent=" + externalCombatPresent + " virtualStateCleared=" + (!Active && _playerHp == 0 && _simHp == 0));
 
@@ -917,11 +917,15 @@ namespace ErenshorDuel
             return maximum <= 0 ? 0 : maximum * FinishPercent / 100;
         }
 
+        // Routed through DiagnosticRecord, not Diagnostic: every field after virtualDelta -
+        // virtualAfter, realBefore, realAfter, yieldThreshold, yield and reason - sat beyond
+        // SafeLabel's 120-character cap and was cut off in live logs, which is precisely the
+        // evidence needed to tell a virtualized hit from a preserved world hit.
         private static void DiagnosticVirtual(string kind, string source, bool playerTarget, int nativeAmount,
             int virtualDelta, int before, int after, int maximum, int realBefore, int realAfter, string reason)
         {
             bool yields = after <= YieldThreshold(maximum);
-            Diagnostic(kind + " target=" + (playerTarget ? "player" : SafeLabel(_simName)) +
+            DiagnosticRecord(kind + " target=" + (playerTarget ? "player" : SafeLabel(_simName)) +
                 " source=" + SafeLabel(source) + " native=" + nativeAmount +
                 " virtualBefore=" + before + "/" + maximum + " virtualDelta=" + virtualDelta +
                 " virtualAfter=" + after + "/" + maximum + " realBefore=" + realBefore +
@@ -1660,7 +1664,7 @@ namespace ErenshorDuel
                     " nativeAmount=" + realDelta + " authority=real_world virtualized=false" +
                     " realHpBefore=" + before + " realHpAfter=" + after +
                     " virtualScale=0.000 virtualDelta=0 worldDamagePreserved=true realEffectPreserved=true";
-                Diagnostic("world_damage " + _lastDamageDiagnostic);
+                DiagnosticRecord("world_damage " + _lastDamageDiagnostic);
                 PopNativeDamageState(state);
 
                 // Native death is authoritative. Do not remirror virtual HP over a dead real actor;
@@ -2193,7 +2197,8 @@ namespace ErenshorDuel
                 // Installed Assembly-CSharp Hotkeys::DoHotkeyTask can pass CurrentTarget for a
                 // SelfOnly spell; native StartSpell later resolves SelfOnly/ApplyToCaster/
                 // InflictOnSelf onto the caster. Preserve that declared self-application model.
-                bool selfCast = DuelSpellAdmissionPolicy.IsSelfCast(targetCharacter == casterCharacter, declaresSelfApplication);
+                bool selfCast = DuelSpellAdmissionPolicy.IsSelfCast(targetCharacter == casterCharacter,
+                    declaresSelfApplication, SpellDamagesTarget(spell));
                 if (selfCast)
                 {
                     bool selfContained = IsSelfContainedDuelCast(spell);
@@ -2501,6 +2506,17 @@ namespace ErenshorDuel
         //
         // The previous test was a whitelist of damage and crowd-control fields, so every *pure*
         // debuff failed it: resist debuffs (NPC.CheckResistDebuffs), snares (NPC.CheckSnareSpell),
+        // Deliberately narrow: only "this spell removes HP from whoever it lands on". It gates the
+        // caller-argument self-cast inference, so it must not sweep in ordinary self-buffs, which are
+        // frequently typed StatusEffect and carry no damage. Declared self-application still wins
+        // over this, so a genuine InflictOnSelf/SelfOnly damage effect is unaffected.
+        private static bool SpellDamagesTarget(Spell spell)
+        {
+            if (spell == null) return false;
+            try { return spell.TargetDamage > 0 || spell.BleedDamagePercent > 0 || spell.Lifetap; }
+            catch { return false; }
+        }
+
         // and stat/attack-speed debuffs carry no TargetDamage and none of the CC booleans, so they
         // were refused at both StartSpell and AddStatusEffect. That left debuff-dependent classes
         // with no working kit in a duel. Spell.Type is the game's own classification, so key off it
@@ -2670,7 +2686,7 @@ namespace ErenshorDuel
             CombatActorClass tickOwnerClass = Classify(_effectTickOwner);
             if (IsDuelParticipantClass(targetClass) && _effectTickOwner != null && _effectTickOwner != target.Myself)
             {
-                Diagnostic("third_party_heal_blocked path=effect_tick source=" + DescribeActor(_effectTickOwner) +
+                DiagnosticRecord("third_party_heal_blocked path=effect_tick source=" + DescribeActor(_effectTickOwner) +
                     " target=" + DescribeActor(target.Myself));
                 return false;
             }
@@ -2735,7 +2751,7 @@ namespace ErenshorDuel
                 // Hostile-world healing is bizarre but remains native rather than being confused
                 // with friendly assistance. Ordinary friendly/protected/unknown help is blocked.
                 if (sourceClass == CombatActorClass.OutsideHostile) return true;
-                Diagnostic("third_party_heal_blocked path=attributed source=" + DescribeActor(source) +
+                DiagnosticRecord("third_party_heal_blocked path=attributed source=" + DescribeActor(source) +
                     " target=" + DescribeActor(target.Myself) + " spell=" + SafeLabel(spell == null ? null : spell.name));
                 result = 0;
                 return false;
@@ -3094,7 +3110,7 @@ namespace ErenshorDuel
             string playerScene = player == null || player.gameObject == null ? "none" : SafeSceneName(player.gameObject);
             bool playerStable = IsAlive(player);
 
-            Diagnostic("diag=summary player_stable=" + playerStable + " player_scene=" + playerScene +
+            DiagnosticRecord("diag=summary player_stable=" + playerStable + " player_scene=" + playerScene +
                 " active_zone=" + activeZone);
 
             int total = 0;
@@ -3486,7 +3502,10 @@ namespace ErenshorDuel
                 if (ErenshorDuelPlugin.Instance == null) return;
                 string clean = (message ?? string.Empty).Replace('\r', ' ').Replace('\n', ' ').Trim();
                 if (clean.Length == 0) return;
-                if (clean.Length > 400) clean = clean.Substring(0, 400);
+                // 400 was still cutting the tail off the widest records: a live spell_commit
+                // measured 424 characters and lost startSpellEntered/startSpellResult, the
+                // fields that say whether native StartSpell actually ran and what it returned.
+                if (clean.Length > 900) clean = clean.Substring(0, 900);
                 ErenshorDuelPlugin.Instance.Diagnostic("[Practice Duel] " + clean);
             }
             catch { }

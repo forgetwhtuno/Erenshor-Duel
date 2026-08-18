@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.4.6 - NPC self-cast misclassification and diagnostic truncation
+
+- Fixed the opposing duelist's offensive spells being resolved onto the caster. A live duel recorded
+  `Burning Chains` (StatusEffect, `TargetDamage=50`) cast by the Sim with the caster as the
+  `StartSpell` Stats argument, classified `self_contained_self_cast`, and applied to the caster
+  instead of the player. Root cause: the 0.4.2 repair inferred self-application from "target argument
+  equals caster", which is sound for the player (Hotkeys hands `StartSpell` the selected target) but
+  not for an NPC. Verified in the installed `Assembly-CSharp`, all three `NPC.DoAttackSpell` call
+  sites pass `CurrentAggroTarget.MyStats` (IL_0a22/IL_0bd7/IL_0d9f), while other native NPC cast
+  paths pass the caster's own Stats for spells that still resolve onto the opponent.
+- A spell that damages its target (`TargetDamage`, `BleedDamagePercent`, or `Lifetap`) can now only
+  become a self-cast when the spell asset declares it via `SelfOnly` / `ApplyToCaster` /
+  `InflictOnSelf`. Declared self-application still outranks the qualifier, so genuine self-damage
+  effects are unchanged, and non-damaging self-buffs/self-heals keep the existing behavior. The
+  0.4.5 targeted heal adaptation is untouched.
+- Fixed damage/healing telemetry being cut mid-field. `DiagnosticVirtual` routed through the 120-char
+  `SafeLabel` cap, so every live `native_damage` / `virtual_damage` / `virtual_heal` line ended at
+  `virtualAfte` and lost `virtualAfter`, `realBefore`, `realAfter`, `yieldThreshold`, `yield` and
+  `reason` - exactly the fields that distinguish a virtualized hit from a preserved world hit. These
+  records now use the record path, as do `world_damage`, `duel_start`, `duel_terminal`, `cleanup`,
+  `diag=summary` and both `third_party_heal_blocked` lines.
+- Raised the record ceiling from 400 to 900 characters. A live `spell_commit` measured 424 and lost
+  `startSpellEntered`, `nativeResult`, `manaBefore`/`manaAfter` and `resourceCommitted` - the fields
+  that say whether native `StartSpell` actually ran and what it returned.
+- Added deterministic coverage for the damaging-spell qualifier and tightened the self-cast source
+  guard to require it.
+
+
 ## 0.4.5 - targeted ordinary self-heal admission
 
 - Preserves the live-proven 0.4.4 scoped `Stats.ReduceHP` damage transaction unchanged.

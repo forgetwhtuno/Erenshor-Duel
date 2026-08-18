@@ -31,7 +31,27 @@ namespace ErenshorDuel
         // declares that native resolution will apply it to the caster regardless of that argument.
         internal static bool IsSelfCast(bool targetArgumentIsCaster, bool declaresSelfApplication)
         {
-            return targetArgumentIsCaster || declaresSelfApplication;
+            return IsSelfCast(targetArgumentIsCaster, declaresSelfApplication, false);
+        }
+
+        // The "target argument equals the caster" inference was written from the PLAYER's side, where
+        // Hotkeys::DoHotkeyTask hands StartSpell the selected target and a caster-equals-target
+        // argument therefore really does mean self-application. It does not generalize to an NPC
+        // duelist. Verified in the installed Assembly-CSharp, all three NPC::DoAttackSpell call sites
+        // pass CurrentAggroTarget.MyStats (IL_0a22/IL_0bd7/IL_0d9f), but other native NPC cast paths
+        // hand StartSpell the caster's own Stats for spells that still resolve onto the opponent.
+        // A live duel showed exactly that: the Sim's Burning Chains (StatusEffect, TargetDamage=50)
+        // arrived with the caster as the Stats argument, was classified self_contained_self_cast, and
+        // resolved onto the caster instead of the player.
+        //
+        // So a spell that damages its target can only become a self-cast when the spell asset itself
+        // declares self-application (SelfOnly / ApplyToCaster / InflictOnSelf). The caller-supplied
+        // argument alone is not enough to turn an offensive spell inward.
+        internal static bool IsSelfCast(bool targetArgumentIsCaster, bool declaresSelfApplication,
+            bool spellDamagesTarget)
+        {
+            if (declaresSelfApplication) return true;
+            return targetArgumentIsCaster && !spellDamagesTarget;
         }
 
         // Recognizing self-application is NOT the same as admitting the cast. An admitted self-cast
@@ -134,6 +154,18 @@ namespace ErenshorDuel
 
             // A self-cast is still recognized the ordinary way when the target argument is the caster.
             if (!IsSelfCast(true, false)) return "FAIL target argument equal to caster must be a self-cast";
+
+            // ...but the caller-supplied argument alone must not turn a DAMAGING spell inward. This is
+            // the live Burning Chains defect: an NPC duelist's offensive StatusEffect (TargetDamage=50)
+            // arrived with the caster as the Stats argument and was resolved onto the caster.
+            if (IsSelfCast(true, false, true))
+                return "FAIL damaging spell with caster-supplied target argument must not become a self-cast";
+            // A declared self-application still outranks the qualifier, so genuine InflictOnSelf
+            // damage effects keep working.
+            if (!IsSelfCast(true, DeclaresSelfApplication(false, false, true), true))
+                return "FAIL declared InflictOnSelf damage spell must remain a self-cast";
+            if (!IsSelfCast(true, false, false))
+                return "FAIL non-damaging caster-targeted spell must remain a self-cast";
 
             // --- 6/7/8: containment safety survives the repair ----------------------------------
             if (IsSelfContainedDuelCast(true, false, false, false))

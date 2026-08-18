@@ -104,8 +104,12 @@ if ($controller -notmatch 'PlayerWorldEffectSlots' -or $controller -notmatch 'Ad
     throw "Duel world-effect guard failed: hostile status effects are not isolated from duel-only cleanup state."
 }
 if ($controller -notmatch 'DeclaresSelfApplication\(spell\)' -or
-    $controller -notmatch 'IsSelfCast\(targetCharacter == casterCharacter, declaresSelfApplication\)') {
-    throw "Duel self-cast guard failed: opponent-selected SelfOnly/ApplyToCaster/InflictOnSelf repair regressed."
+    $controller -notmatch 'IsSelfCast\(targetCharacter == casterCharacter,' -or
+    $controller -notmatch 'declaresSelfApplication, SpellDamagesTarget\(spell\)\)' -or
+    $controller -notmatch 'private static bool SpellDamagesTarget' -or
+    $spellPolicy -notmatch 'bool spellDamagesTarget' -or
+    $spellPolicy -notmatch 'return targetArgumentIsCaster && !spellDamagesTarget;') {
+    throw "Duel self-cast guard failed: declared self-application repair, or the damaging-spell qualifier that stops an NPC caster's offensive spell from being read as a self-cast, regressed."
 }
 if ($controller -notmatch 'TryAdaptOpponentHealToSelf' -or
     $controller -notmatch 'ref Stats target' -or
