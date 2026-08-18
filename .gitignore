@@ -5,3 +5,4 @@ obj/
 *.rsp
 *.dll
 *.pdb
+*-handoff.zip

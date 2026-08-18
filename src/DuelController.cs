@@ -16,7 +16,15 @@ namespace ErenshorDuel
             GroupedLocalSim,
             GroupedSimOwnedPet,
             OutsideHostile,
+            ProtectedNonParticipant,
             Unknown
+        }
+
+        private enum PeriodicDamageAuthority
+        {
+            DuelVirtual,
+            WorldReal,
+            Ambiguous
         }
 
         private static Character _player;
@@ -59,6 +67,11 @@ namespace ErenshorDuel
         private static readonly Dictionary<int, Spell> SimInitialEffects = new Dictionary<int, Spell>();
         private static readonly Dictionary<int, EffectSlotSnapshot> PlayerInitialEffectState = new Dictionary<int, EffectSlotSnapshot>();
         private static readonly Dictionary<int, EffectSlotSnapshot> SimInitialEffectState = new Dictionary<int, EffectSlotSnapshot>();
+        // Real hostile-world status effects admitted during the duel are tracked by fixed status-slot
+        // index and exact Spell reference. Only these slots are allowed to advance the real cleanup
+        // baseline; duel-owned buffs/debuffs must never leak into that baseline.
+        private static readonly Dictionary<int, Spell> PlayerWorldEffectSlots = new Dictionary<int, Spell>();
+        private static readonly Dictionary<int, Spell> SimWorldEffectSlots = new Dictionary<int, Spell>();
         private static int _playerInitialSpellShield;
         private static int _simInitialSpellShield;
         private static Character _playerInitialLastHitBy;
@@ -86,11 +99,14 @@ namespace ErenshorDuel
         private static readonly HashSet<NPC> PostDuelPetNpcs = new HashSet<NPC>();
         [ThreadStatic]
         private static Character _effectTickOwner;
-        // Set only while one of Erenshor's three ordinary damage methods is calculating an
-        // admitted duel hit. The ReduceHP patch below captures the already-mitigated amount and
-        // prevents the real HP write/death branch without replacing the game's hit calculation.
+        // Set only while one of Erenshor's ordinary damage methods is resolving a contained edge.
+        // Duel-participant hits let native Erenshor calculate mitigation/etc.; the exact in-flight
+        // Stats.ReduceHP call is captured/suppressed and that final effective amount is applied once
+        // to virtual HP. Hostile-world hits use the separate real-world ledger and remain native.
         [ThreadStatic]
         private static NativeDamageState _nativeDamageInFlight;
+        [ThreadStatic]
+        private static StandaloneWorldDamageState _standaloneWorldDamageInFlight;
         private static int _lastCountdown;
         private static DuelLifecycleState _state;
         private static float _stateStartedAt;
@@ -282,7 +298,7 @@ namespace ErenshorDuel
                 EmergencyCleanup("Start.StateTransition");
                 return;
             }
-            Diagnostic("duel_start build=" + DuelBuildInfo.Id +
+            DiagnosticRecord("duel_start build=" + DuelBuildInfo.Id +
                 " playerReal=" + _playerRealHp + "/" + _playerMax +
                 " opponentReal=" + _simRealHp + "/" + _simMax +
                 " playerVirtual=" + _playerHp + "/" + _playerMax +
@@ -309,14 +325,10 @@ namespace ErenshorDuel
             if (!ParticipantScopesStillMatch()) { Cancel("Tick.PartyScope", null, null, null, "Duel cancelled because a participant's party membership changed."); return; }
             if (Vector3.Distance(_player.transform.position, _sim.transform.position) > MaximumDistance) { Cancel("Tick.Distance", null, null, null, "Duel cancelled because the duelists moved too far apart."); return; }
             if (IsCampActive(false)) { Cancel("Tick.Camp", null, null, null, "Duel cancelled because Hunt Camp is active."); return; }
-            NPC externalAttacker;
-            Character externalTarget;
-            if (TryGetExternalAttacker(out externalAttacker, out externalTarget))
-            {
-                Cancel("Tick.AttackingPlayer", NpcCharacter(externalAttacker), externalTarget, externalTarget,
-                    "Duel cancelled because a verified outside attacker entered party combat.");
-                return;
-            }
+            // Hostile-world PvE may overlap an active Practice Duel. Mere hostile aggro/presence
+            // is not interference: exact hostile-world edges remain native/real and are never
+            // translated into virtual duel health. Friendly/unknown assistance stays contained at
+            // the per-action hooks below.
 
             float elapsed = Time.unscaledTime - _stateStartedAt;
             if (_state == DuelLifecycleState.Preparing && elapsed >= 1f)
@@ -374,14 +386,22 @@ namespace ErenshorDuel
                     Stop("Practice duel timed out after 30 seconds. No winner.");
                     return;
                 }
-                // A grouped Sim can acquire transient targets from healing, buffs, pets, or
-                // ordinary party-assist AI. Target state alone is not proof of outside combat;
-                // just keep it pinned to the player unconditionally.
-                _simNpc.CurrentAggroTarget = _player;
-                if (_spectatorDuel) _firstSimNpc.CurrentAggroTarget = _sim;
+                // Keep the duel target only while native AI has not selected a verified hostile
+                // world enemy. Hostile PvE target ownership is real gameplay and outranks the duel
+                // pin until native combat clears it; friendly/unknown transient targets do not.
+                Character simTarget = _simNpc.CurrentAggroTarget;
+                bool simFightingWorld = Classify(simTarget) == CombatActorClass.OutsideHostile;
+                if (!simFightingWorld) _simNpc.CurrentAggroTarget = _player;
+                bool firstFightingWorld = false;
+                if (_spectatorDuel)
+                {
+                    Character firstTarget = _firstSimNpc.CurrentAggroTarget;
+                    firstFightingWorld = Classify(firstTarget) == CombatActorClass.OutsideHostile;
+                    if (!firstFightingWorld) _firstSimNpc.CurrentAggroTarget = _sim;
+                }
                 PurgeDuelistsFromNearbyEnemies();
-                try { _simNpc.HighPriorityNavUpdate(_player.transform.position); } catch { }
-                if (_spectatorDuel) try { _firstSimNpc.HighPriorityNavUpdate(_sim.transform.position); } catch { }
+                if (!simFightingWorld) try { _simNpc.HighPriorityNavUpdate(_player.transform.position); } catch { }
+                if (_spectatorDuel && !firstFightingWorld) try { _firstSimNpc.HighPriorityNavUpdate(_sim.transform.position); } catch { }
             }
         }
 
@@ -442,7 +462,7 @@ namespace ErenshorDuel
             bool autoAttackBefore = ReadPlayerAutoattack();
             string targetBefore = DescribeActor(GameData.PlayerControl == null ? null : GameData.PlayerControl.CurrentTarget);
             bool externalCombatPresent = HasUnsafeRealCombat(_player, _sim, _simNpc);
-            Diagnostic("duel_terminal reason=" + SafeLabel(reason) + " active=" + wasActive +
+            DiagnosticRecord("duel_terminal reason=" + SafeLabel(reason) + " active=" + wasActive +
                 " cleanup=" + hadDuelState + " autoAttackBefore=" + autoAttackBefore +
                 " targetBefore=" + targetBefore + " externalCombatPresent=" + externalCombatPresent);
             if (hadDuelState) BeginPostDuelAttackCleanup();
@@ -566,7 +586,7 @@ namespace ErenshorDuel
             bool autoAttackAfter = ReadPlayerAutoattack();
             ClearSessionState();
             RunPostDuelAttackCleanup();
-            Diagnostic("cleanup autoAttackBefore=" + autoAttackBefore + " autoAttackAfter=" + autoAttackAfter +
+            DiagnosticRecord("cleanup autoAttackBefore=" + autoAttackBefore + " autoAttackAfter=" + autoAttackAfter +
                 " targetBefore=" + targetBefore + " targetAfter=" + targetAfter +
                 " externalCombatPresent=" + externalCombatPresent + " virtualStateCleared=" + (!Active && _playerHp == 0 && _simHp == 0));
 
@@ -897,11 +917,15 @@ namespace ErenshorDuel
             return maximum <= 0 ? 0 : maximum * FinishPercent / 100;
         }
 
+        // Routed through DiagnosticRecord, not Diagnostic: every field after virtualDelta -
+        // virtualAfter, realBefore, realAfter, yieldThreshold, yield and reason - sat beyond
+        // SafeLabel's 120-character cap and was cut off in live logs, which is precisely the
+        // evidence needed to tell a virtualized hit from a preserved world hit.
         private static void DiagnosticVirtual(string kind, string source, bool playerTarget, int nativeAmount,
             int virtualDelta, int before, int after, int maximum, int realBefore, int realAfter, string reason)
         {
             bool yields = after <= YieldThreshold(maximum);
-            Diagnostic(kind + " target=" + (playerTarget ? "player" : SafeLabel(_simName)) +
+            DiagnosticRecord(kind + " target=" + (playerTarget ? "player" : SafeLabel(_simName)) +
                 " source=" + SafeLabel(source) + " native=" + nativeAmount +
                 " virtualBefore=" + before + "/" + maximum + " virtualDelta=" + virtualDelta +
                 " virtualAfter=" + after + "/" + maximum + " realBefore=" + realBefore +
@@ -943,7 +967,7 @@ namespace ErenshorDuel
                     _player.LastHitBy = _playerInitialLastHitBy;
                     _player.MyStats.RecentDmg = _playerInitialRecentDmg;
                     _player.MyStats.RecentDmgByPlayer = _playerInitialRecentDmgByPlayer;
-                    _player.MyStats.CurrentHP = Math.Max(1, Math.Min(_player.MyStats.CurrentMaxHP, _playerRealHp));
+                    RestoreRealLedgerHp(_player, _playerRealHp);
                 }
             }
             catch { }
@@ -956,10 +980,124 @@ namespace ErenshorDuel
                     _sim.LastHitBy = _simInitialLastHitBy;
                     _sim.MyStats.RecentDmg = _simInitialRecentDmg;
                     _sim.MyStats.RecentDmgByPlayer = _simInitialRecentDmgByPlayer;
-                    _sim.MyStats.CurrentHP = Math.Max(1, Math.Min(_sim.MyStats.CurrentMaxHP, _simRealHp));
+                    RestoreRealLedgerHp(_sim, _simRealHp);
                 }
             }
             catch { }
+        }
+
+        private static int RealLedgerHp(Character target)
+        {
+            if (target == _player) return _playerRealHp;
+            if (target == _sim) return _simRealHp;
+            try { return target == null || target.MyStats == null ? 0 : target.MyStats.CurrentHP; }
+            catch { return 0; }
+        }
+
+        private static void SetRealLedgerHp(Character target, int value)
+        {
+            int safe = Math.Max(0, value);
+            if (target == _player) _playerRealHp = safe;
+            else if (target == _sim) _simRealHp = safe;
+        }
+
+        private static void RestoreRealLedgerHp(Character target, int value)
+        {
+            if (target == null || target.MyStats == null) return;
+            // A real hostile-world kill is authoritative. Never turn a native death into a duel
+            // full-heal by restoring the pre-duel snapshot. If the actor still lives, restore the
+            // updated real-world ledger that includes any hostile PvE damage taken mid-duel.
+            if (value <= 0 && !IsAlive(target)) return;
+            target.MyStats.CurrentHP = Math.Max(1, Math.Min(target.MyStats.CurrentMaxHP, value));
+        }
+
+        private static void AdoptCurrentRealDamageState(Character target)
+        {
+            if (target == null || target.MyStats == null) return;
+            // Do not snapshot every status slot here: the participant may also be carrying
+            // duel-only buffs/debuffs. Only native damage metadata/shield consumption is adopted
+            // broadly. Hostile status effects use AdoptWorldStatusEffectSlots below.
+            if (target == _player)
+            {
+                _playerInitialSpellShield = target.MyStats.SpellShield;
+                _playerInitialLastHitBy = target.LastHitBy;
+                _playerInitialRecentDmg = target.MyStats.RecentDmg;
+                _playerInitialRecentDmgByPlayer = target.MyStats.RecentDmgByPlayer;
+            }
+            else if (target == _sim)
+            {
+                _simInitialSpellShield = target.MyStats.SpellShield;
+                _simInitialLastHitBy = target.LastHitBy;
+                _simInitialRecentDmg = target.MyStats.RecentDmg;
+                _simInitialRecentDmgByPlayer = target.MyStats.RecentDmgByPlayer;
+            }
+        }
+
+        private static EffectSlotSnapshot SnapshotEffectSlot(StatusEffect slot)
+        {
+            return new EffectSlotSnapshot
+            {
+                Effect = slot == null ? null : slot.Effect,
+                Duration = slot == null ? 0f : slot.Duration,
+                FromPlayer = slot != null && slot.fromPlayer,
+                BonusDamage = slot == null ? 0 : slot.bonusDmg,
+                CastedByPc = slot != null && slot.CastedByPC,
+                Owner = slot == null ? null : slot.Owner,
+                CreditDps = slot == null ? null : slot.CreditDPS
+            };
+        }
+
+        private static void AdoptWorldStatusEffectSlots(Character target, Spell worldSpell)
+        {
+            if (target == null || target.MyStats == null || target.MyStats.StatusEffects == null || worldSpell == null) return;
+            Dictionary<int, Spell> initial = target == _player ? PlayerInitialEffects : SimInitialEffects;
+            Dictionary<int, EffectSlotSnapshot> state = target == _player ? PlayerInitialEffectState : SimInitialEffectState;
+            Dictionary<int, Spell> tracked = target == _player ? PlayerWorldEffectSlots : SimWorldEffectSlots;
+            StatusEffect[] effects = target.MyStats.StatusEffects;
+            for (int i = 0; i < effects.Length; i++)
+            {
+                StatusEffect slot = effects[i];
+                Spell current = slot == null ? null : slot.Effect;
+                if (current != worldSpell) continue;
+                initial[i] = current;
+                state[i] = SnapshotEffectSlot(slot);
+                tracked[i] = current;
+            }
+            AdoptCurrentRealDamageState(target);
+        }
+
+        private static void RefreshTrackedWorldEffects(Character target)
+        {
+            if (target == null || target.MyStats == null || target.MyStats.StatusEffects == null) return;
+            Dictionary<int, Spell> initial = target == _player ? PlayerInitialEffects : SimInitialEffects;
+            Dictionary<int, EffectSlotSnapshot> state = target == _player ? PlayerInitialEffectState : SimInitialEffectState;
+            Dictionary<int, Spell> tracked = target == _player ? PlayerWorldEffectSlots : SimWorldEffectSlots;
+            if (tracked.Count == 0) return;
+            StatusEffect[] effects = target.MyStats.StatusEffects;
+            List<int> remove = null;
+            foreach (KeyValuePair<int, Spell> pair in tracked)
+            {
+                int index = pair.Key;
+                if (index < 0 || index >= effects.Length) continue;
+                StatusEffect slot = effects[index];
+                Spell current = slot == null ? null : slot.Effect;
+                if (current == pair.Value)
+                {
+                    initial[index] = current;
+                    state[index] = SnapshotEffectSlot(slot);
+                }
+                else if (current == null)
+                {
+                    // The genuine world effect expired/was consumed naturally. Update the real
+                    // baseline to empty so cleanup cannot resurrect it. A different non-null spell
+                    // may be a temporary duel effect, so leave the world baseline untouched.
+                    initial[index] = null;
+                    state[index] = SnapshotEffectSlot(slot);
+                    if (remove == null) remove = new List<int>();
+                    remove.Add(index);
+                }
+            }
+            if (remove != null) for (int i = 0; i < remove.Count; i++) tracked.Remove(remove[i]);
         }
 
         private static void SnapshotEffects(Stats stats, Dictionary<int, Spell> destination,
@@ -973,16 +1111,7 @@ namespace ErenshorDuel
             {
                 StatusEffect slot = effects[i];
                 destination[i] = slot == null ? null : slot.Effect;
-                stateDestination[i] = new EffectSlotSnapshot
-                {
-                    Effect = slot == null ? null : slot.Effect,
-                    Duration = slot == null ? 0f : slot.Duration,
-                    FromPlayer = slot != null && slot.fromPlayer,
-                    BonusDamage = slot == null ? 0 : slot.bonusDmg,
-                    CastedByPc = slot != null && slot.CastedByPC,
-                    Owner = slot == null ? null : slot.Owner,
-                    CreditDps = slot == null ? null : slot.CreditDPS
-                };
+                stateDestination[i] = SnapshotEffectSlot(slot);
             }
         }
 
@@ -1136,6 +1265,10 @@ namespace ErenshorDuel
                    " campSource=" + (camp.Source ?? "none") +
                    " huntCamp=" + camp.HuntCampActive +
                    " relax=" + camp.RelaxActive +
+                   " realLedger=" + _playerRealHp + "/" + _simRealHp +
+                   " lastSpell=" + _lastSpellAdmission +
+                   " lastDamage=" + _lastDamageDiagnostic +
+                   " lastAoE=" + _lastAoeDiagnostic +
                    " coop=" + CoopCompatibility.Describe();
         }
 
@@ -1181,19 +1314,31 @@ namespace ErenshorDuel
 
         internal sealed class NativeDamageState
         {
+            internal NativeDamageState Previous;
             internal Character Target;
+            internal Character Attacker;
             internal int VirtualBefore;
             internal int RealBefore;
             internal int NativeBefore;
             internal int RawDamage;
             internal string Source;
             internal bool FromPlayer;
+            internal bool WorldReal;
             internal Character.Faction OriginalFaction;
             internal bool FactionChanged;
             internal int OriginalLayer;
             internal bool LayerCaptured;
             internal int CapturedReduceHpDamage;
             internal bool CapturedReduceHp;
+        }
+
+        internal sealed class StandaloneWorldDamageState
+        {
+            internal Character Target;
+            internal int RealBefore;
+            internal string Source;
+            internal bool NestedNativeWorldDamage;
+            internal bool Completed;
         }
 
         private struct EffectSlotSnapshot
@@ -1329,18 +1474,130 @@ namespace ErenshorDuel
             EngagedPets.Clear();
         }
 
-        // Let Erenshor calculate the hit once so armor, resistances, active buffs, crits,
-        // and native damage modifiers remain authoritative. The scoped ReduceHP patch captures
-        // the final amount and suppresses its real-HP mutation, so native death handling never
-        // sees a temporary/max-int HP value.
+        private static PeriodicDamageAuthority ResolvePeriodicBleedAuthority(Character target)
+        {
+            if (target == null || target.MyStats == null || target.MyStats.StatusEffects == null)
+                return PeriodicDamageAuthority.DuelVirtual;
+            bool duelOwned = false;
+            bool worldOwned = false;
+            Dictionary<int, Spell> trackedWorld = target == _player ? PlayerWorldEffectSlots : SimWorldEffectSlots;
+            StatusEffect[] effects = target.MyStats.StatusEffects;
+            for (int i = 0; i < effects.Length; i++)
+            {
+                StatusEffect slot = effects[i];
+                Spell effect = slot == null ? null : slot.Effect;
+                if (effect == null) continue;
+                bool bleedLike = false;
+                try { bleedLike = effect.BleedDamagePercent > 0 || slot.bonusDmg > 0; } catch { }
+                if (!bleedLike) continue;
+
+                Spell tracked;
+                if (trackedWorld.TryGetValue(i, out tracked) && tracked == effect) worldOwned = true;
+                Character owner = null;
+                try { owner = slot.Owner != null ? slot.Owner : slot.CreditDPS; } catch { }
+                if (DuelPrincipal(owner) != null) duelOwned = true;
+                else if (Classify(owner) == CombatActorClass.OutsideHostile) worldOwned = true;
+            }
+            if (worldOwned && duelOwned) return PeriodicDamageAuthority.Ambiguous;
+            if (worldOwned) return PeriodicDamageAuthority.WorldReal;
+            return PeriodicDamageAuthority.DuelVirtual;
+        }
+
+        private static bool IsUnattributedPeriodicBleed(Character target, Character attacker, string source)
+        {
+            return attacker == null && target != null && target == _effectTickOwner &&
+                   (target == _player || target == _sim) && source != null &&
+                   source.IndexOf("BleedDamageMe", StringComparison.Ordinal) >= 0;
+        }
+
+        // Let Erenshor calculate an admitted participant hit once so armor, resistances, active
+        // buffs, crits and native modifiers remain authoritative. During that exact transaction,
+        // the scoped Stats.ReduceHP Prefix captures the final effective reduction and suppresses
+        // only the participant's real/mirrored HP write. FinishNativeDamage applies the captured
+        // amount once to virtual Duel HP. No synthetic HP headroom enters native calculation.
+        //
+        // Hostile world -> duelist takes the opposite path: the participant is temporarily exposed
+        // at its real-world HP ledger, the native hit is allowed unchanged, and that real result is
+        // adopted into the ledger. It is never translated into virtual Duel HP.
         internal static bool PrepareNativeDamage(Character target, Character attacker, int rawDamage, bool fromPlayer,
             ref int result, ref NativeDamageState state, string source)
         {
             if (!Active) return true;
             bool duelHit = IsDuelHit(target, attacker);
-            bool playerHit = duelHit && target == _player;
-            bool simHit = duelHit && target == _sim;
-            if (!duelHit) return !TryVirtualDamage(target, attacker, rawDamage, ref result, source);
+
+            if (!duelHit && IsUnattributedPeriodicBleed(target, attacker, source))
+            {
+                PeriodicDamageAuthority periodicAuthority = ResolvePeriodicBleedAuthority(target);
+                if (periodicAuthority == PeriodicDamageAuthority.Ambiguous)
+                {
+                    result = 0;
+                    _lastDamageDiagnostic = "source=" + SafeLabel(source) +
+                        " sourceRole=periodic_ambiguous targetRole=" + ParticipantRole(target) +
+                        " authority=blocked virtualized=false reason=mixed_world_and_duel_periodic_sources";
+                    DiagnosticRecord("damage_authority " + _lastDamageDiagnostic);
+                    Cancel("Periodic.SourceAmbiguous", null, target, target,
+                        "Duel cancelled because overlapping periodic effects could not be attributed safely.");
+                    return false;
+                }
+                if (periodicAuthority == PeriodicDamageAuthority.WorldReal)
+                {
+                    int realHp = RealLedgerHp(target);
+                    state = new NativeDamageState
+                    {
+                        Previous = _nativeDamageInFlight,
+                        Target = target,
+                        Attacker = null,
+                        RealBefore = realHp,
+                        NativeBefore = realHp,
+                        RawDamage = rawDamage,
+                        Source = source,
+                        FromPlayer = fromPlayer,
+                        WorldReal = true
+                    };
+                    _nativeDamageInFlight = state;
+                    try { target.MyStats.CurrentHP = Math.Max(1, realHp); }
+                    catch { _nativeDamageInFlight = state.Previous; state = null; }
+                    return true;
+                }
+            }
+
+            if (!duelHit)
+            {
+                // Periodic Duel-owned bleeds and explicit containment paths may already claim this
+                // call. If not, classify exact source/target authority before deciding whether a
+                // world-real transaction is needed.
+                if (TryVirtualDamage(target, attacker, rawDamage, ref result, source)) return false;
+
+                CombatActorClass attackerClass = Classify(attacker);
+                CombatActorClass targetClass = Classify(target);
+                if (IsDuelParticipantClass(targetClass) && attackerClass == CombatActorClass.OutsideHostile)
+                {
+                    int realHp = RealLedgerHp(target);
+                    if (realHp <= 0) return true;
+                    state = new NativeDamageState
+                    {
+                        Previous = _nativeDamageInFlight,
+                        Target = target,
+                        Attacker = attacker,
+                        RealBefore = realHp,
+                        NativeBefore = realHp,
+                        RawDamage = rawDamage,
+                        Source = source,
+                        FromPlayer = fromPlayer,
+                        WorldReal = true
+                    };
+                    _nativeDamageInFlight = state;
+                    try { target.MyStats.CurrentHP = realHp; }
+                    catch
+                    {
+                        _nativeDamageInFlight = state.Previous;
+                        state = null;
+                    }
+                    return true;
+                }
+                return true;
+            }
+
             if (attacker != _player && attacker != _sim) RememberEngagedPet(attacker);
             if (_state != DuelLifecycleState.Active)
             {
@@ -1348,16 +1605,23 @@ namespace ErenshorDuel
                 return false;
             }
 
+            bool playerHit = target == _player;
             int virtualBefore = playerHit ? _playerHp : _simHp;
+            int nativeBefore = virtualBefore;
+            try { if (target.MyStats != null) nativeBefore = target.MyStats.CurrentHP; } catch { }
+
             state = new NativeDamageState
             {
+                Previous = _nativeDamageInFlight,
                 Target = target,
+                Attacker = attacker,
                 VirtualBefore = virtualBefore,
-                RealBefore = target.MyStats.CurrentHP,
-                NativeBefore = target.MyStats.CurrentHP,
+                RealBefore = RealLedgerHp(target),
+                NativeBefore = nativeBefore,
                 RawDamage = rawDamage,
                 Source = source,
-                FromPlayer = fromPlayer
+                FromPlayer = fromPlayer,
+                WorldReal = false
             };
             _nativeDamageInFlight = state;
             try
@@ -1383,41 +1647,88 @@ namespace ErenshorDuel
         internal static void FinishNativeDamage(NativeDamageState state, int nativeResult)
         {
             if (state == null || state.Target == null) return;
-            // A nested native callback can terminate the duel before the outer DamageMe postfix
-            // runs. Never apply a stale virtual ledger after terminal cleanup has restored real
-            // health and cleared participant ownership.
+            int nativeAfter = state.NativeBefore;
+            try { nativeAfter = state.Target.MyStats.CurrentHP; } catch { }
+
+            if (state.WorldReal)
+            {
+                if (_standaloneWorldDamageInFlight != null && _standaloneWorldDamageInFlight.Target == state.Target)
+                    _standaloneWorldDamageInFlight.NestedNativeWorldDamage = true;
+                int before = state.RealBefore;
+                int after = Math.Max(0, nativeAfter);
+                SetRealLedgerHp(state.Target, after);
+                AdoptCurrentRealDamageState(state.Target);
+                int realDelta = Math.Max(0, before - after);
+                _lastDamageDiagnostic = "source=" + SafeLabel(state.Source) +
+                    " sourceRole=hostile_world targetRole=" + ParticipantRole(state.Target) +
+                    " nativeAmount=" + realDelta + " authority=real_world virtualized=false" +
+                    " realHpBefore=" + before + " realHpAfter=" + after +
+                    " virtualScale=0.000 virtualDelta=0 worldDamagePreserved=true realEffectPreserved=true";
+                DiagnosticRecord("world_damage " + _lastDamageDiagnostic);
+                PopNativeDamageState(state);
+
+                // Native death is authoritative. Do not remirror virtual HP over a dead real actor;
+                // normal participant-validity cleanup will end the practice session.
+                if (IsAlive(state.Target) && DuelLifecyclePolicy.IsCombatActive(_state)) MirrorVirtualHealth();
+                return;
+            }
+
+            // A nested callback can terminate the duel before the outer DamageMe postfix runs.
+            // Never apply a stale virtual ledger after terminal cleanup has restored real state.
             if (!DuelLifecyclePolicy.IsCombatActive(_state) || (state.Target != _player && state.Target != _sim))
             {
                 RestoreNativeHitState(state);
                 return;
             }
-            string factionLabel = state.FactionChanged ? state.OriginalFaction + "->duel" : "unchanged";
-            int effective = state.CapturedReduceHp
-                ? Math.Max(0, state.CapturedReduceHpDamage)
-                : Math.Max(0, nativeResult);
+
+            int captured = state.CapturedReduceHp ? Math.Max(0, state.CapturedReduceHpDamage) : 0;
+            int effective = DuelCombatSemanticsPolicy.EffectiveCapturedDamage(
+                state.CapturedReduceHp, captured, nativeResult);
             bool playerHit = state.Target == _player;
-            if (playerHit) _playerHp = Math.Max(1, _playerHp - effective);
-            else if (state.Target == _sim) _simHp = Math.Max(1, _simHp - effective);
-            try { state.Target.MyStats.CurrentHP = playerHit ? _playerHp : _simHp; } catch { }
+            if (playerHit) _playerHp = DuelSafetyPolicy.ApplyVirtualDamageOnce(_playerHp, effective);
+            else if (state.Target == _sim) _simHp = DuelSafetyPolicy.ApplyVirtualDamageOnce(_simHp, effective);
+
+            string factionLabel = state.FactionChanged ? state.OriginalFaction + "->duel" : "unchanged";
             RestoreNativeHitState(state);
             MirrorVirtualHealth();
             int hp = playerHit ? _playerHp : _simHp;
             int max = playerHit ? _playerMax : _simMax;
+            int mirroredAfter = 0;
+            try { mirroredAfter = state.Target.MyStats.CurrentHP; } catch { }
+            int realAfter = RealLedgerHp(state.Target);
+            _lastDamageDiagnostic = "source=" + SafeLabel(state.Source) +
+                " nativeEntry=" + SafeLabel(state.Source) +
+                " sourceRole=" + DamageSourceRole(state.Attacker) + " targetRole=" + ParticipantRole(state.Target) +
+                " raw=" + state.RawDamage +
+                " reduceHpCaptured=" + state.CapturedReduceHp + " capturedEffectiveDamage=" + captured +
+                " nativeResult=" + nativeResult + " authority=virtual_duel virtualized=true" +
+                " virtualScale=1.000 virtualBefore=" + state.VirtualBefore + " virtualDelta=" + effective +
+                " virtualAfter=" + hp + " realHpBefore=" + state.RealBefore + " realHpAfter=" + realAfter +
+                " mirroredHpAfter=" + mirroredAfter +
+                " realEffectSuppressed=true worldDamagePreserved=false faction=" + factionLabel;
             DiagnosticVirtual("native_damage", state.Source, playerHit, state.RawDamage, effective,
-                state.VirtualBefore, hp, max, state.RealBefore, state.Target.MyStats.CurrentHP,
-                "nativeResult=" + nativeResult + " fromPlayer=" + state.FromPlayer + " faction=" + factionLabel);
-            if (hp * 100 <= max * FinishPercent)
+                state.VirtualBefore, hp, max, state.RealBefore, realAfter,
+                "reduceHpCaptured=" + state.CapturedReduceHp + " capturedEffectiveDamage=" + captured +
+                " virtualScale=1.000 fromPlayer=" + state.FromPlayer + " faction=" + factionLabel);
+            if (DuelSafetyPolicy.ReachedYieldThreshold(hp, max, FinishPercent))
             {
                 try { Stop(ParticipantLabel(state.Target) + " yields. Friendly duel complete!"); } catch { }
             }
         }
 
-        // Also reached from the Harmony finalizers, so it must be safe to call twice and safe to
-        // call when the native method threw partway through.
+        private static void PopNativeDamageState(NativeDamageState state)
+        {
+            if (state == null) return;
+            if (_nativeDamageInFlight == state) _nativeDamageInFlight = state.Previous;
+        }
+
+        // Also reached from Harmony finalizers. It is safe to call twice and safe when the native
+        // method threw partway through. Duel hits restore scoped faction/layer ownership; world
+        // hits release the scoped real-HP exposure and remirror virtual HP if the actor lives.
         internal static void RestoreNativeHitState(NativeDamageState state)
         {
             if (state == null || state.Target == null) return;
-            if (_nativeDamageInFlight == state) _nativeDamageInFlight = null;
+            PopNativeDamageState(state);
             if (state.FactionChanged)
             {
                 try { state.Target.MyFaction = state.OriginalFaction; } catch { }
@@ -1425,23 +1736,26 @@ namespace ErenshorDuel
             }
             if (state.LayerCaptured)
             {
-                // Belt and braces: the headroom above should stop DamageMe's corpse branch from
-                // running at all, but a duelist left on the dead layer is unrecoverable in-session.
                 try { if (state.Target.gameObject.layer != state.OriginalLayer) state.Target.gameObject.layer = state.OriginalLayer; } catch { }
                 state.LayerCaptured = false;
             }
-            MirrorVirtualHealth();
+            if (DuelLifecyclePolicy.IsCombatActive(_state) && IsAlive(state.Target)) MirrorVirtualHealth();
         }
 
-        // This is deliberately narrower than a global ReduceHP replacement: only the exact Stats
-        // object whose admitted native duel hit is currently resolving is intercepted. The native
-        // caller still receives a non-lethal result and continues through its normal calculation,
-        // while virtual HP receives the final post-mitigation amount in FinishNativeDamage.
+        // Capture/suppress only the final HP reduction belonging to the exact virtual Duel damage
+        // transaction at the top of the thread-local transaction stack. World-real damage and every
+        // ordinary Erenshor ReduceHP call pass through unchanged. This is the live-proven 0.4.1
+        // semantic boundary, modernized with the current nested NativeDamageState stack.
         internal static bool CaptureNativeReduceHp(Stats stats, int damage, ref bool result)
         {
             NativeDamageState state = _nativeDamageInFlight;
-            if (state == null || stats == null || state.Target == null || state.Target.MyStats != stats)
+            bool exactStats = state != null && stats != null && state.Target != null && state.Target.MyStats == stats;
+            bool combatActive = DuelLifecyclePolicy.IsCombatActive(_state);
+            bool exactDuelEdge = state != null && IsDuelHit(state.Target, state.Attacker);
+            if (!DuelCombatSemanticsPolicy.ShouldCaptureReduceHp(
+                state != null, state != null && state.WorldReal, exactStats, combatActive, exactDuelEdge))
                 return true;
+
             state.CapturedReduceHpDamage = damage;
             state.CapturedReduceHp = true;
             result = false;
@@ -1452,8 +1766,6 @@ namespace ErenshorDuel
         {
             if (!Active || target == null || damage <= 0) return false;
             bool duelHit = IsDuelHit(target, attacker);
-            bool playerHit = duelHit && target == _player;
-            bool simHit = duelHit && target == _sim;
             if (duelHit)
             {
                 if (_state != DuelLifecycleState.Active)
@@ -1468,55 +1780,62 @@ namespace ErenshorDuel
 
             // Stats.TickEffects invokes BleedDamageMe with a null attacker. The active effect-tick
             // owner proves this is a periodic hit on the duelist, but Erenshor's API does not retain
-            // the original caster on that bleed path. Keep the hit virtual rather than silently
-            // losing every bleed tick (or letting it touch mirrored real HP).
-            if (target == _effectTickOwner && (target == _player || target == _sim) &&
-                eventSource.IndexOf("BleedDamageMe", StringComparison.Ordinal) >= 0)
+            // the original caster on that bleed path. Keep a verified Duel-owned tick virtual.
+            if (IsUnattributedPeriodicBleed(target, attacker, eventSource))
+            {
+                PeriodicDamageAuthority periodicAuthority = ResolvePeriodicBleedAuthority(target);
+                if (periodicAuthority == PeriodicDamageAuthority.DuelVirtual)
+                {
+                    if (_state != DuelLifecycleState.Active) { result = 0; return true; }
+                    ApplyVirtualDamage(target, damage, eventSource, "periodic_bleed_unattributed=true authority=duel_virtual");
+                    result = damage;
+                    return true;
+                }
+                // WorldReal is handled by PrepareNativeDamage so real HP can be exposed around the
+                // native call. Ambiguous is cancelled/suppressed there before reaching this path.
+                return false;
+            }
+
+            Character principal = DuelPrincipal(attacker);
+            CombatActorClass attackerClass = Classify(attacker);
+            CombatActorClass targetClass = Classify(target);
+            bool targetIsDuelist = IsDuelParticipantClass(targetClass);
+            bool targetIsWorldHostile = targetClass == CombatActorClass.OutsideHostile;
+            bool sourceWorldHostile = attackerClass == CombatActorClass.OutsideHostile;
+            bool sourceFriendlyOrProtected = IsFriendlyPartyClass(attackerClass) ||
+                                             attackerClass == CombatActorClass.ProtectedNonParticipant;
+            bool sourceUnknown = attackerClass == CombatActorClass.Unknown;
+            DuelDamageAuthority authority = DuelCombatSemanticsPolicy.ResolveDamageAuthority(
+                principal != null, targetIsDuelist, sourceWorldHostile, targetIsWorldHostile,
+                sourceFriendlyOrProtected, sourceUnknown);
+
+            if (authority == DuelDamageAuthority.VirtualDuel)
             {
                 if (_state != DuelLifecycleState.Active) { result = 0; return true; }
-                ApplyVirtualDamage(target, damage, eventSource, "periodic_bleed_unattributed=true");
+                ApplyVirtualDamage(target, damage, eventSource, "authority=virtual_duel");
                 result = damage;
                 return true;
             }
 
-            CombatActorClass attackerClass = Classify(attacker);
-            CombatActorClass targetClass = Classify(target);
-
-            // Friendly party actions, including pet attacks or late projectiles, cannot damage a
-            // duelist. They are ignored without converting ordinary party AI into a cancellation.
-            if (IsDuelParticipantClass(targetClass) && IsFriendlyPartyClass(attackerClass))
+            if (authority == DuelDamageAuthority.RealWorld)
             {
-                result = 0;
-                return true;
-            }
-
-            // Neither duelist -- nor a pet admitted on a duelist's behalf -- may create real damage,
-            // threat, XP, loot, or faction effects against a third actor. The duel-hit check above
-            // has already claimed everything aimed at the opposing duelist, so anything reaching
-            // here from a duel side is aimed outside the match.
-            if (DuelPrincipal(attacker) != null)
-            {
-                result = 0;
-                return true;
-            }
-
-            DuelOutsideEffectDisposition directIngress = DuelSafetyPolicy.DirectHostileIngress(
-                IsDuelParticipantClass(targetClass), IsFriendlyPartyClass(attackerClass),
-                attackerClass == CombatActorClass.OutsideHostile, attackerClass == CombatActorClass.Unknown);
-            if (directIngress == DuelOutsideEffectDisposition.Block)
-            {
-                result = 0;
-                return true;
-            }
-            if (directIngress == DuelOutsideEffectDisposition.Cancel)
-            {
-                // The direct damage call itself is authoritative evidence that an outside actor is
-                // participating, even when its exact actor category is unknown (e.g. a COOP proxy
-                // or non-party Sim). Restore real duel state first, then let Erenshor process the
-                // outside hit normally.
-                Cancel(eventSource, attacker, target, target,
-                    "Duel cancelled because an outside actor directly damaged a duelist.");
+                _lastDamageDiagnostic = "source=" + SafeLabel(eventSource) +
+                    " sourceRole=" + DamageSourceRole(attacker) + " targetRole=" + DamageTargetRole(target) +
+                    " raw=" + damage + " authority=real_world virtualized=false realEffectPreserved=pending_native";
+                DiagnosticRecord("damage_authority " + _lastDamageDiagnostic);
                 return false;
+            }
+
+            if (authority == DuelDamageAuthority.Block)
+            {
+                result = 0;
+                _lastDamageDiagnostic = "source=" + SafeLabel(eventSource) +
+                    " sourceRole=" + DamageSourceRole(attacker) + " targetRole=" + DamageTargetRole(target) +
+                    " raw=" + damage + " authority=blocked virtualized=false realEffectSuppressed=true";
+                DiagnosticRecord("damage_authority " + _lastDamageDiagnostic);
+                if (principal != null && !targetIsDuelist && !targetIsWorldHostile)
+                    NotifyUnsafeAreaBystander();
+                return true;
             }
 
             return false;
@@ -1526,17 +1845,26 @@ namespace ErenshorDuel
         {
             bool playerHit = target == _player;
             int hpBefore = playerHit ? _playerHp : _simHp;
-            if (playerHit) _playerHp = Math.Max(1, _playerHp - Math.Max(0, damage));
-            else if (target == _sim) _simHp = Math.Max(1, _simHp - Math.Max(0, damage));
+            int realBefore = RealLedgerHp(target);
+            int effective = Math.Max(0, damage);
+            if (playerHit) _playerHp = DuelSafetyPolicy.ApplyVirtualDamageOnce(_playerHp, effective);
+            else if (target == _sim) _simHp = DuelSafetyPolicy.ApplyVirtualDamageOnce(_simHp, effective);
             else return;
             MirrorVirtualHealth();
             int hp = playerHit ? _playerHp : _simHp;
             int max = playerHit ? _playerMax : _simMax;
-            int realAfter = 0;
-            try { realAfter = target.MyStats.CurrentHP; } catch { }
-            DiagnosticVirtual("virtual_damage", eventSource, playerHit, damage, Math.Max(0, damage), hpBefore, hp, max,
-                realAfter, realAfter, reason);
-            if (hp * 100 <= max * FinishPercent)
+            int realAfter = RealLedgerHp(target);
+            _lastDamageDiagnostic = "source=" + SafeLabel(eventSource) +
+                " nativeEntry=" + SafeLabel(eventSource) +
+                " sourceRole=direct_contained targetRole=" + ParticipantRole(target) +
+                " raw=" + damage + " reduceHpCaptured=false capturedEffectiveDamage=0" +
+                " nativeAmount=" + effective + " authority=virtual_duel virtualized=true" +
+                " virtualScale=1.000 virtualBefore=" + hpBefore + " virtualDelta=" + effective +
+                " virtualAfter=" + hp + " realHpBefore=" + realBefore + " realHpAfter=" + realAfter +
+                " realEffectSuppressed=true worldDamagePreserved=false reason=" + SafeLabel(reason);
+            DiagnosticVirtual("virtual_damage", eventSource, playerHit, damage, effective, hpBefore, hp, max,
+                realBefore, realAfter, reason);
+            if (DuelSafetyPolicy.ReachedYieldThreshold(hp, max, FinishPercent))
             {
                 try { Stop(ParticipantLabel(target) + " yields. Friendly duel complete!"); }
                 catch { }
@@ -1579,15 +1907,54 @@ namespace ErenshorDuel
             return true;
         }
 
-        internal static bool HandleDamageShield(Character target, int damage, Stats shieldOwner)
+        internal static bool BeginDamageShield(Character target, int damage, Stats shieldOwner, ref StandaloneWorldDamageState state)
         {
             if (!Active || target == null || shieldOwner == null) return true;
             Character attacker = null;
             try { attacker = shieldOwner.Myself; } catch { }
+
             int ignored = 0;
-            if (!TryVirtualDamage(target, attacker, damage, ref ignored, "Harmony.Character.DamageShieldTaken"))
-                return true;
-            return false;
+            if (TryVirtualDamage(target, attacker, damage, ref ignored, "Harmony.Character.DamageShieldTaken"))
+                return false;
+
+            if (IsDuelParticipantClass(Classify(target)) && Classify(attacker) == CombatActorClass.OutsideHostile)
+            {
+                int realHp = RealLedgerHp(target);
+                state = new StandaloneWorldDamageState
+                {
+                    Target = target,
+                    RealBefore = realHp,
+                    Source = "Harmony.Character.DamageShieldTaken"
+                };
+                _standaloneWorldDamageInFlight = state;
+                try { if (target.MyStats != null) target.MyStats.CurrentHP = Math.Max(1, realHp); } catch { }
+            }
+            return true;
+        }
+
+        internal static void FinishDamageShield(StandaloneWorldDamageState state)
+        {
+            if (state == null || state.Completed || state.Target == null) return;
+            state.Completed = true;
+            if (_standaloneWorldDamageInFlight == state) _standaloneWorldDamageInFlight = null;
+
+            if (!state.NestedNativeWorldDamage)
+            {
+                int after = state.RealBefore;
+                try { if (state.Target.MyStats != null) after = Math.Max(0, state.Target.MyStats.CurrentHP); } catch { }
+                SetRealLedgerHp(state.Target, after);
+                AdoptCurrentRealDamageState(state.Target);
+                _lastDamageDiagnostic = "source=" + SafeLabel(state.Source) +
+                    " nativeEntry=" + SafeLabel(state.Source) +
+                    " sourceRole=hostile_world targetRole=" + ParticipantRole(state.Target) +
+                    " raw=unavailable nativeAmount=" + Math.Max(0, state.RealBefore - after) +
+                    " reduceHpCaptured=false capturedEffectiveDamage=0" +
+                    " authority=real_world virtualized=false realHpBefore=" + state.RealBefore +
+                    " realHpAfter=" + after + " virtualScale=0.000 virtualDelta=0" +
+                    " worldDamagePreserved=true realEffectPreserved=true standalone=true";
+                DiagnosticRecord("world_damage " + _lastDamageDiagnostic);
+            }
+            if (DuelLifecyclePolicy.IsCombatActive(_state) && IsAlive(state.Target)) MirrorVirtualHealth();
         }
 
         internal static bool AllowAggro(NPC npc, Character target, string eventSource)
@@ -1599,7 +1966,16 @@ namespace ErenshorDuel
             if (actorClass == CombatActorClass.DuelParticipant)
             {
                 Character opponent = DuelOpponentFor(npc);
-                if (_state == DuelLifecycleState.Active && target == opponent) npc.CurrentAggroTarget = opponent;
+                if (_state == DuelLifecycleState.Active && target == opponent)
+                {
+                    npc.CurrentAggroTarget = opponent;
+                    return false; // Duel owns the exact participant<->participant target edge.
+                }
+                if (targetClass == CombatActorClass.OutsideHostile)
+                {
+                    DiagnosticRecord("world_aggro source=duelist target=hostile_world preserved=true");
+                    return true;
+                }
                 return false;
             }
 
@@ -1612,12 +1988,17 @@ namespace ErenshorDuel
                 return true;
             }
 
-            DuelOutsideEffectDisposition directIngress = DuelSafetyPolicy.DirectHostileIngress(
-                IsDuelParticipantClass(targetClass), IsFriendlyPartyClass(actorClass),
-                actorClass == CombatActorClass.OutsideHostile, actorClass == CombatActorClass.Unknown);
-            if (directIngress == DuelOutsideEffectDisposition.Cancel)
-                Cancel(eventSource, NpcCharacter(npc), target, target,
-                    "Duel cancelled because an outside actor directly acquired a duelist as an aggro target.");
+            if (IsDuelParticipantClass(targetClass))
+            {
+                if (actorClass == CombatActorClass.OutsideHostile)
+                {
+                    DiagnosticRecord("world_aggro source=hostile_world target=duelist preserved=true sourceHook=" + SafeLabel(eventSource));
+                    return true;
+                }
+                // Friendly/protected/unknown nonparticipants may not join the duel through aggro.
+                return false;
+            }
+
             return true;
         }
 
@@ -1627,15 +2008,27 @@ namespace ErenshorDuel
             CombatActorClass recipientClass = Classify(npc);
             CombatActorClass attackerClass = Classify(attacker);
 
-            if (recipientClass == CombatActorClass.DuelParticipant && IsFriendlyPartyClass(attackerClass)) return false;
-            if (IsDuelParticipantClass(attackerClass)) return false;
+            if (recipientClass == CombatActorClass.DuelParticipant)
+            {
+                if (attackerClass == CombatActorClass.OutsideHostile)
+                {
+                    DiagnosticRecord("world_threat source=hostile_world target=duelist preserved=true sourceHook=" + SafeLabel(eventSource));
+                    return true;
+                }
+                if (IsFriendlyPartyClass(attackerClass) || attackerClass == CombatActorClass.ProtectedNonParticipant ||
+                    attackerClass == CombatActorClass.Unknown) return false;
+            }
 
-            DuelOutsideEffectDisposition directIngress = DuelSafetyPolicy.DirectHostileIngress(
-                IsDuelParticipantClass(recipientClass), IsFriendlyPartyClass(attackerClass),
-                attackerClass == CombatActorClass.OutsideHostile, attackerClass == CombatActorClass.Unknown);
-            if (directIngress == DuelOutsideEffectDisposition.Cancel)
-                Cancel(eventSource, attacker, NpcCharacter(npc), NpcCharacter(npc),
-                    "Duel cancelled because an outside actor directly generated threat against a duelist.");
+            if (IsDuelParticipantClass(attackerClass))
+            {
+                if (recipientClass == CombatActorClass.OutsideHostile)
+                {
+                    DiagnosticRecord("world_threat source=duelist target=hostile_world preserved=true sourceHook=" + SafeLabel(eventSource));
+                    return true;
+                }
+                return false;
+            }
+
             return true;
         }
 
@@ -1647,9 +2040,12 @@ namespace ErenshorDuel
             CombatActorClass actorClass = Classify(npc);
             if (actorClass == CombatActorClass.DuelParticipant)
             {
-                // The old guard returned false for every selected-Sim attack spell and skill.
-                // Permit native class offense only during the fight and only against the player.
-                return _state == DuelLifecycleState.Active && npc.CurrentAggroTarget == DuelOpponentFor(npc);
+                if (_state != DuelLifecycleState.Active) return false;
+                Character current = npc.CurrentAggroTarget;
+                if (current == DuelOpponentFor(npc)) return true;
+                // If a real hostile world NPC joined the fight, the dueling Sim's native response
+                // remains normal PvE and is not forced through the virtual duel path.
+                return Classify(current) == CombatActorClass.OutsideHostile;
             }
             if (!IsFriendlyPartyClass(actorClass)) return true;
             Character currentTarget = npc.CurrentAggroTarget;
@@ -1657,6 +2053,111 @@ namespace ErenshorDuel
             // An admitted pet fights the opposing duelist with its own attack spells and skills;
             // its damage lands on that duelist's virtual ledger like any other duel hit.
             return IsAdmittedPetEngagement(NpcCharacter(npc), currentTarget);
+        }
+
+        internal sealed class SpellStartState
+        {
+            internal Stats CasterStats;
+            internal int ManaBefore;
+            internal bool Allowed;
+            internal bool Completed;
+            internal string Source;
+        }
+
+        internal static bool BeginSpellStart(CastSpell caster, Spell spell, ref Stats target, ref bool result,
+            string eventSource, ref SpellStartState state)
+        {
+            Stats originalTarget = target;
+            // The product adaptation is intentionally limited to the ordinary StartSpell overloads
+            // reached by normal cast/hotbar flow. Proc/no-animation callbacks keep their native target
+            // semantics and are contained by the existing per-effect source/target guards.
+            bool directCastEntry = !string.IsNullOrEmpty(eventSource) &&
+                eventSource.StartsWith("Harmony.CastSpell.StartSpell/", StringComparison.Ordinal);
+            bool adaptedToSelf = directCastEntry && TryAdaptOpponentHealToSelf(caster, spell, ref target);
+            bool allow = AllowSpellStart(caster, spell, target, ref result, eventSource);
+            if (Active && adaptedToSelf)
+            {
+                DiagnosticRecord("spell_target_adaptation spell=" + SafeLabel(spell == null ? null : spell.SpellName) +
+                    " originalTarget=" + DamageTargetRole(originalTarget == null ? null : originalTarget.Myself) +
+                    " resolvedTarget=" + DamageTargetRole(target == null ? null : target.Myself) +
+                    " currentTargetPreserved=true mode=single_target_heal_to_self");
+                _lastSpellAdmission += " targetAdaptedToSelf=true originalTargetArg=" +
+                    DamageTargetRole(originalTarget == null ? null : originalTarget.Myself) +
+                    " resolvedTargetArg=" + DamageTargetRole(target == null ? null : target.Myself);
+            }
+            if (Active && caster != null && IsDuelParticipantClass(Classify(caster.MyChar)))
+            {
+                Stats stats = null;
+                int mana = -1;
+                try
+                {
+                    stats = caster.MyChar == null ? null : caster.MyChar.MyStats;
+                    if (stats != null) mana = stats.CurrentMana;
+                }
+                catch { }
+                state = new SpellStartState
+                {
+                    CasterStats = stats,
+                    ManaBefore = mana,
+                    Allowed = allow,
+                    Source = eventSource
+                };
+            }
+            return allow;
+        }
+
+        internal static void FinishSpellStart(SpellStartState state, bool nativeResult)
+        {
+            if (state == null || state.Completed) return;
+            state.Completed = true;
+            int manaAfter = -1;
+            try { if (state.CasterStats != null) manaAfter = state.CasterStats.CurrentMana; } catch { }
+            bool resourceCommitted = state.ManaBefore >= 0 && manaAfter >= 0 && manaAfter < state.ManaBefore;
+            _lastSpellAdmission +=
+                " startSpellEntered=" + state.Allowed +
+                " nativeResult=" + nativeResult +
+                " manaBefore=" + state.ManaBefore +
+                " manaAfter=" + manaAfter +
+                " resourceCommitted=" + resourceCommitted +
+                " cooldownCommitted=unavailable_in_supplied_api";
+            DiagnosticRecord("spell_commit " + _lastSpellAdmission);
+        }
+
+        private static bool TryAdaptOpponentHealToSelf(CastSpell caster, Spell spell, ref Stats target)
+        {
+            if (!Active || _state != DuelLifecycleState.Active || caster == null || spell == null) return false;
+            Character casterCharacter = null;
+            Character targetCharacter = null;
+            try { casterCharacter = caster.MyChar; } catch { }
+            try { targetCharacter = target == null ? null : target.Myself; } catch { }
+            if (!IsDuelParticipantClass(Classify(casterCharacter))) return false;
+            Character opponent = casterCharacter == _player ? _sim : casterCharacter == _sim ? _player : null;
+            if (opponent == null || targetCharacter != opponent) return false;
+
+            bool healType = false, group = false, ae = false, pbae = false, pet = false, charm = false, proc = false;
+            int targetHealing = 0, targetDamage = 0;
+            try { healType = spell.Type == Spell.SpellType.Heal; } catch { }
+            try { targetHealing = spell.TargetHealing; } catch { }
+            try { targetDamage = spell.TargetDamage; } catch { }
+            try { group = spell.GroupEffect; } catch { }
+            try { ae = spell.Type == Spell.SpellType.AE; } catch { }
+            try { pbae = spell.Type == Spell.SpellType.PBAE; } catch { }
+            try { pet = spell.PetToSummon != null; } catch { }
+            try { charm = spell.CharmTarget; } catch { }
+            try { proc = spell.AddProc != null; } catch { }
+
+            bool adapt = DuelSpellAdmissionPolicy.CanAdaptOpponentHealToSelf(
+                true, true, true, healType, targetHealing, targetDamage,
+                group, ae, pbae, pet, charm, proc);
+            if (!adapt) return false;
+            try
+            {
+                Stats selfStats = casterCharacter.MyStats;
+                if (selfStats == null || selfStats.Myself != casterCharacter) return false;
+                target = selfStats;
+                return true;
+            }
+            catch { return false; }
         }
 
         internal static bool AllowSpellStart(CastSpell caster, Spell spell, Stats target, ref bool result, string eventSource)
@@ -1667,41 +2168,72 @@ namespace ErenshorDuel
 
             if (IsDuelParticipantClass(casterClass))
             {
-                if (_state != DuelLifecycleState.Active) return BlockSpell(ref result);
+                if (_state != DuelLifecycleState.Active)
+                    return RecordSpellAdmission(spell, casterClass, targetClass, false, false,
+                        "blocked", "lifecycle_not_active", eventSource, BlockSpell(ref result));
 
                 Character casterCharacter = caster.MyChar;
                 Character targetCharacter = target == null ? null : target.Myself;
-                bool selfCast = targetCharacter == casterCharacter ||
-                                (target == null && spell != null && (spell.SelfOnly || spell.ApplyToCaster || spell.InflictOnSelf));
+                bool declaresSelfApplication = DeclaresSelfApplication(spell);
+
+                // Area shape must be decided before the self-target shortcut. Native PBAE/group
+                // spells commonly pass the caster (or an unrelated selected Stats) even though the
+                // eventual per-target effect set is larger. Admit a structurally containable area
+                // cast only after bounded native-candidate preflight; every actual per-target
+                // damage/heal/status edge is still independently authorized below.
+                if (IsAreaSpell(spell))
+                {
+                    string areaReason;
+                    bool areaAllowed = PreflightAreaSpell(casterCharacter, spell, targetCharacter, out areaReason);
+                    if (!areaAllowed && areaReason.IndexOf("bystander", StringComparison.OrdinalIgnoreCase) >= 0)
+                        NotifyUnsafeAreaBystander();
+                    return RecordSpellAdmission(spell, casterClass, targetClass, declaresSelfApplication,
+                        targetCharacter == casterCharacter, areaAllowed ? "allowed" : "blocked",
+                        areaAllowed ? "area_per_target_containment" : areaReason, eventSource,
+                        areaAllowed || BlockSpell(ref result));
+                }
+
+                // The Stats handed to StartSpell is NOT a statement of who the spell will affect.
+                // Installed Assembly-CSharp Hotkeys::DoHotkeyTask can pass CurrentTarget for a
+                // SelfOnly spell; native StartSpell later resolves SelfOnly/ApplyToCaster/
+                // InflictOnSelf onto the caster. Preserve that declared self-application model.
+                bool selfCast = DuelSpellAdmissionPolicy.IsSelfCast(targetCharacter == casterCharacter,
+                    declaresSelfApplication, SpellDamagesTarget(spell));
                 if (selfCast)
                 {
-                    // Self-heals, HoTs, buffs, and ordinary class self-effects are legitimate, but
-                    // "self-targeted" is not the same as "stays inside the 1v1". A Druid/Necromancer
-                    // pet summon, a charm, and a group-wide self-buff all resolve as self-casts and
-                    // then reach actors outside the duel.
-                    return IsSelfContainedDuelCast(spell) || BlockSpell(ref result);
+                    bool selfContained = IsSelfContainedDuelCast(spell);
+                    return RecordSpellAdmission(spell, casterClass, targetClass, declaresSelfApplication, true,
+                        selfContained ? "allowed" : "blocked",
+                        selfContained ? "self_contained_self_cast" : "self_cast_not_containable",
+                        eventSource, selfContained || BlockSpell(ref result));
                 }
 
                 if (IsDuelParticipantClass(targetClass))
                 {
-                    // Cross-heals/buffs are not part of the duel. Only a safely bounded offensive
-                    // spell may target the opponent; damage still routes through virtual HP.
-                    return IsSafeDuelOffense(spell) || BlockSpell(ref result);
+                    bool safeOffense = IsSafeDuelOffense(spell);
+                    return RecordSpellAdmission(spell, casterClass, targetClass, declaresSelfApplication, false,
+                        safeOffense ? "allowed" : "blocked",
+                        safeOffense ? "duel_offense" : "not_safe_duel_offense",
+                        eventSource, safeOffense || BlockSpell(ref result));
                 }
 
-                // A participant cannot cast at a third actor or launch an untargeted/group/summon
-                // spell that could escape the 1v1 boundary.
-                return BlockSpell(ref result);
+                // The participant may attack a verified ordinary hostile NPC with its normal kit.
+                // This is real Erenshor combat, not virtual duel damage. Protected/ambiguous third
+                // actors remain fail-closed.
+                if (targetClass == CombatActorClass.OutsideHostile && IsSafeDuelOffense(spell))
+                    return RecordSpellAdmission(spell, casterClass, targetClass, declaresSelfApplication, false,
+                        "allowed", "hostile_world_real_offense", eventSource, true);
+
+                if ((targetClass == CombatActorClass.ProtectedNonParticipant || targetClass == CombatActorClass.Unknown) &&
+                    IsKnownOffensivePayload(spell))
+                    NotifyUnsafeAreaBystander();
+                return RecordSpellAdmission(spell, casterClass, targetClass, declaresSelfApplication, false,
+                    "blocked", "participant_cast_at_protected_or_unknown_actor", eventSource, BlockSpell(ref result));
             }
 
             if (IsFriendlyPartyClass(casterClass))
             {
-                // Only block when the cast actually targets a duelist. A blanket GroupEffect block
-                // would also stop a real group heal aimed at a non-duel party member fighting a
-                // real mob elsewhere, which the duel does not otherwise cancel for.
                 if (!IsDuelParticipantClass(targetClass)) return true;
-                // An admitted pet may use its own offensive casts on the opposing duelist. Everyone
-                // else -- including the pet of a party Sim who is not duelling -- stays blocked.
                 Character petCaster = caster.MyChar;
                 Character petTarget = target == null ? null : target.Myself;
                 if (IsAdmittedPetEngagement(petCaster, petTarget) && IsSafeDuelOffense(spell))
@@ -1712,14 +2244,13 @@ namespace ErenshorDuel
                 return BlockSpell(ref result);
             }
 
+            // Verified hostile-world casts are real native PvE even while a duel is active. Their
+            // resulting damage/effects are kept in the separate real ledger and never virtualized.
             if (IsDuelParticipantClass(targetClass) && casterClass == CombatActorClass.OutsideHostile)
-            {
-                Cancel(eventSource, caster.MyChar, target.Myself, target.Myself,
-                    "Duel cancelled because an outside actor directly cast at a duelist.");
-                return true; // cleanup/HP restoration is complete; let real combat proceed.
-            }
+                return true;
 
-            if (IsDuelParticipantClass(targetClass) && casterClass == CombatActorClass.Unknown)
+            if (IsDuelParticipantClass(targetClass) &&
+                (casterClass == CombatActorClass.ProtectedNonParticipant || casterClass == CombatActorClass.Unknown))
                 return BlockSpell(ref result);
 
             return true;
@@ -1748,8 +2279,8 @@ namespace ErenshorDuel
             {
                 try
                 {
-                    if (current.GroupEffect || current.PetToSummon != null || current.CharmTarget) return false;
-                    if (!allowProc && current.AddProc != null) return false;
+                    if (!DuelSpellAdmissionPolicy.StaysOnOneTarget(current.GroupEffect, current.PetToSummon != null,
+                            current.CharmTarget, current.AddProc != null, allowProc)) return false;
                     Spell next = current.StatusEffectToApply;
                     if (next == null || next == current) return true;
                     current = next;
@@ -1757,6 +2288,212 @@ namespace ErenshorDuel
                 catch { return false; }
             }
             return true;
+        }
+
+        private static bool IsAreaSpell(Spell spell)
+        {
+            if (spell == null) return false;
+            try
+            {
+                return DuelSpellAdmissionPolicy.IsAreaShape(
+                    spell.GroupEffect, spell.Type == Spell.SpellType.AE, spell.Type == Spell.SpellType.PBAE);
+            }
+            catch { return false; }
+        }
+
+        private static bool IsAreaStructurallyContainable(Spell spell)
+        {
+            Spell current = spell;
+            for (int depth = 0; current != null && depth < 8; depth++)
+            {
+                try
+                {
+                    if (!DuelSpellAdmissionPolicy.IsAreaStructurallyContainable(
+                        current.PetToSummon != null, current.CharmTarget, current.AddProc != null)) return false;
+                    Spell next = current.StatusEffectToApply;
+                    if (next == null || next == current) return true;
+                    current = next;
+                }
+                catch { return false; }
+            }
+            return current == null;
+        }
+
+        private static bool IsKnownOffensivePayload(Spell spell)
+        {
+            Spell current = spell;
+            for (int depth = 0; current != null && depth < 8; depth++)
+            {
+                try
+                {
+                    if (current.TargetDamage > 0 || current.BleedDamagePercent > 0 || current.Lifetap ||
+                        current.Aggro > 0 || current.RootTarget || current.StunTarget || current.FearTarget ||
+                        current.CrowdControlSpell || current.JoltSpell || current.TauntSpell ||
+                        current.Type == Spell.SpellType.Damage || current.Type == Spell.SpellType.StatusEffect)
+                        return true;
+                    if ((current.Type == Spell.SpellType.AE || current.Type == Spell.SpellType.PBAE) &&
+                        current.TargetHealing <= 0 && current.PercentManaRestoration <= 0) return true;
+                    Spell next = current.StatusEffectToApply;
+                    if (next == null || next == current) break;
+                    current = next;
+                }
+                catch { return false; }
+            }
+            return false;
+        }
+
+        private static bool IsKnownBeneficialPayload(Spell spell)
+        {
+            Spell current = spell;
+            for (int depth = 0; current != null && depth < 8; depth++)
+            {
+                try
+                {
+                    if (current.TargetHealing > 0 || current.PercentManaRestoration > 0 ||
+                        current.Type == Spell.SpellType.Heal || current.Type == Spell.SpellType.Beneficial) return true;
+                    Spell next = current.StatusEffectToApply;
+                    if (next == null || next == current) break;
+                    current = next;
+                }
+                catch { return false; }
+            }
+            return false;
+        }
+
+        private static bool PreflightAreaSpell(Character caster, Spell spell, Character passedTarget, out string rejectReason)
+        {
+            rejectReason = "area_unknown";
+            bool offensive = IsKnownOffensivePayload(spell);
+            bool beneficial = IsKnownBeneficialPayload(spell);
+            bool structural = IsAreaStructurallyContainable(spell);
+            bool allow = structural && DuelSpellAdmissionPolicy.CanAdmitArea(
+                offensive, beneficial, false, false, false, true);
+
+            HashSet<Character> candidates = new HashSet<Character>();
+            if (passedTarget != null) candidates.Add(passedTarget);
+            try
+            {
+                if (caster != null && offensive && caster.NearbyEnemies != null)
+                    for (int i = 0; i < caster.NearbyEnemies.Count && candidates.Count < 48; i++)
+                        if (caster.NearbyEnemies[i] != null) candidates.Add(caster.NearbyEnemies[i]);
+                if (caster != null && beneficial && caster.NearbyFriends != null)
+                    for (int i = 0; i < caster.NearbyFriends.Count && candidates.Count < 48; i++)
+                        if (caster.NearbyFriends[i] != null) candidates.Add(caster.NearbyFriends[i]);
+            }
+            catch { }
+
+            int participants = 0, hostileWorld = 0, protectedActors = 0, unknown = 0, friendly = 0;
+            foreach (Character candidate in candidates)
+            {
+                CombatActorClass c = Classify(candidate);
+                if (IsDuelParticipantClass(c)) participants++;
+                else if (c == CombatActorClass.OutsideHostile) hostileWorld++;
+                else if (c == CombatActorClass.ProtectedNonParticipant) protectedActors++;
+                else if (c == CombatActorClass.GroupedLocalSim || c == CombatActorClass.GroupedSimOwnedPet) friendly++;
+                else unknown++;
+            }
+
+            // For offensive areas, native NearbyEnemies is the best bounded candidate collection
+            // available in the supplied current source. A protected/ambiguous actor in that native
+            // enemy-candidate set is conservatively rejected before StartSpell. Friendly candidates
+            // are not inferred to be blast targets merely from NearbyFriends; if native per-target
+            // resolution nevertheless reaches them, the damage/effect hook blocks that exact edge.
+            bool unsafeOffensiveCandidate = offensive && (protectedActors > 0 || unknown > 0);
+            if (unsafeOffensiveCandidate) allow = false;
+
+            string shape = "GroupEffect";
+            try
+            {
+                if (spell.Type == Spell.SpellType.PBAE) shape = "PBAE";
+                else if (spell.Type == Spell.SpellType.AE) shape = "AE";
+                else if (!spell.GroupEffect) shape = spell.Type.ToString();
+            }
+            catch { }
+            _lastAoeDiagnostic = "spell=" + SafeLabel(spell == null ? null : spell.SpellName) +
+                " shape=" + shape + " radius=unavailable_in_supplied_api" +
+                " offensive=" + offensive + " beneficial=" + beneficial + " structural=" + structural +
+                " candidates=" + candidates.Count + " participants=" + participants +
+                " hostileWorld=" + hostileWorld + " friendly=" + friendly +
+                " protected=" + protectedActors + " unknown=" + unknown +
+                " hostileWorldAllowed=true perTargetContainment=true admission=" + (allow ? "allowed" : "blocked");
+            DiagnosticRecord("aoe_preflight " + _lastAoeDiagnostic);
+
+            if (!structural) rejectReason = "area_uncontainable_pet_charm_or_proc";
+            else if (!offensive && !beneficial) rejectReason = "area_payload_unknown";
+            else if (unsafeOffensiveCandidate) rejectReason = "area_bystander_in_native_candidate_set";
+            else rejectReason = allow ? "area_per_target_containment" : "area_not_admitted";
+            return allow;
+        }
+
+        // Bounded, privacy-safe record of the most recent duel spell-admission decision. One line per
+        // decision (not per frame), holding only spell shape and role tokens - never player identity,
+        // save data, or paths. Surfaced through /eduel diag so a live "dead button" can be explained
+        // without guessing at which stage it died.
+        private static string _lastSpellAdmission = "none";
+        private static string _lastDamageDiagnostic = "none";
+        private static string _lastAoeDiagnostic = "none";
+        private static float _lastBystanderMessageAt = -1000f;
+
+        internal static string LastSpellAdmission { get { return _lastSpellAdmission; } }
+
+        private static bool RecordSpellAdmission(Spell spell, CombatActorClass casterClass, CombatActorClass targetClass,
+            bool declaresSelfApplication, bool computedSelfCast, string admission, string stage, string eventSource, bool allow)
+        {
+            try
+            {
+                string name = "unknown";
+                string type = "unknown";
+                bool selfOnly = false, applyToCaster = false, inflictOnSelf = false, groupEffect = false;
+                int targetHealing = 0, targetDamage = 0;
+                bool pet = false, charm = false;
+                if (spell != null)
+                {
+                    try { name = string.IsNullOrEmpty(spell.SpellName) ? spell.name : spell.SpellName; } catch { }
+                    try { type = spell.Type.ToString(); } catch { }
+                    try { selfOnly = spell.SelfOnly; } catch { }
+                    try { applyToCaster = spell.ApplyToCaster; } catch { }
+                    try { inflictOnSelf = spell.InflictOnSelf; } catch { }
+                    try { groupEffect = spell.GroupEffect; } catch { }
+                    try { targetHealing = spell.TargetHealing; } catch { }
+                    try { targetDamage = spell.TargetDamage; } catch { }
+                    try { pet = spell.PetToSummon != null; } catch { }
+                    try { charm = spell.CharmTarget; } catch { }
+                }
+                _lastSpellAdmission =
+                    "spell=" + SafeLabel(name) +
+                    " nativeType=" + type +
+                    " caster=" + casterClass +
+                    " targetArg=" + targetClass +
+                    " selfOnly=" + selfOnly +
+                    " applyToCaster=" + applyToCaster +
+                    " inflictOnSelf=" + inflictOnSelf +
+                    " declaresSelfApplication=" + declaresSelfApplication +
+                    " computedSelfCast=" + computedSelfCast +
+                    " targetHealing=" + targetHealing +
+                    " targetDamage=" + targetDamage +
+                    " groupEffect=" + groupEffect +
+                    " petSummon=" + pet +
+                    " charm=" + charm +
+                    " admission=" + admission +
+                    " stage=" + stage +
+                    " startSpellAllowedToRun=" + allow +
+                    " source=" + (eventSource ?? "unknown");
+                DiagnosticRecord("spell_admission " + _lastSpellAdmission);
+            }
+            catch { }
+            return allow;
+        }
+
+        // Does the spell itself declare that native resolution applies it to the caster? This is a
+        // property of the spell asset, independent of whatever Stats the caller happened to pass -
+        // see the DoHotkeyTask note in AllowSpellStart. Recognizing self-application is NOT the same
+        // as admitting the cast: an admitted self-cast must still clear IsSelfContainedDuelCast, so
+        // group effects, pet summons and charms stay blocked exactly as before.
+        internal static bool DeclaresSelfApplication(Spell spell)
+        {
+            if (spell == null) return false;
+            try { return DuelSpellAdmissionPolicy.DeclaresSelfApplication(spell.SelfOnly, spell.ApplyToCaster, spell.InflictOnSelf); }
+            catch { return false; }
         }
 
         private static bool IsSelfContainedDuelCast(Spell spell)
@@ -1769,6 +2506,17 @@ namespace ErenshorDuel
         //
         // The previous test was a whitelist of damage and crowd-control fields, so every *pure*
         // debuff failed it: resist debuffs (NPC.CheckResistDebuffs), snares (NPC.CheckSnareSpell),
+        // Deliberately narrow: only "this spell removes HP from whoever it lands on". It gates the
+        // caller-argument self-cast inference, so it must not sweep in ordinary self-buffs, which are
+        // frequently typed StatusEffect and carry no damage. Declared self-application still wins
+        // over this, so a genuine InflictOnSelf/SelfOnly damage effect is unaffected.
+        private static bool SpellDamagesTarget(Spell spell)
+        {
+            if (spell == null) return false;
+            try { return spell.TargetDamage > 0 || spell.BleedDamagePercent > 0 || spell.Lifetap; }
+            catch { return false; }
+        }
+
         // and stat/attack-speed debuffs carry no TargetDamage and none of the CC booleans, so they
         // were refused at both StartSpell and AddStatusEffect. That left debuff-dependent classes
         // with no working kit in a duel. Spell.Type is the game's own classification, so key off it
@@ -1776,6 +2524,8 @@ namespace ErenshorDuel
         private static bool IsSafeDuelOffense(Spell spell)
         {
             if (spell == null) return false;
+            if (IsAreaSpell(spell))
+                return IsAreaStructurallyContainable(spell) && IsKnownOffensivePayload(spell);
             if (!StaysOnOneTarget(spell, false)) return false;
             try
             {
@@ -1805,6 +2555,15 @@ namespace ErenshorDuel
             internal Stats Target;
             internal int Before;
             internal bool Track;
+        }
+
+        internal sealed class StatusEffectIngressState
+        {
+            internal Character Target;
+            internal bool PreserveWorldReal;
+            internal bool Completed;
+            internal int RealBefore;
+            internal Spell Spell;
         }
 
         internal sealed class HealEvaluationState
@@ -1927,7 +2686,7 @@ namespace ErenshorDuel
             CombatActorClass tickOwnerClass = Classify(_effectTickOwner);
             if (IsDuelParticipantClass(targetClass) && _effectTickOwner != null && _effectTickOwner != target.Myself)
             {
-                Diagnostic("third_party_heal_blocked path=effect_tick source=" + DescribeActor(_effectTickOwner) +
+                DiagnosticRecord("third_party_heal_blocked path=effect_tick source=" + DescribeActor(_effectTickOwner) +
                     " target=" + DescribeActor(target.Myself));
                 return false;
             }
@@ -1946,15 +2705,41 @@ namespace ErenshorDuel
 
         internal static void FinishEffectTick(Character previousOwner)
         {
+            Character completedOwner = _effectTickOwner;
+            if (completedOwner == _player || completedOwner == _sim) RefreshTrackedWorldEffects(completedOwner);
             _effectTickOwner = previousOwner;
         }
 
         internal static bool BeginAttributedHeal(Stats target, Spell spell, Character source, bool isMana, ref int result, ref HealCapture state)
         {
-            if (!Active || target == null || isMana) return true;
+            if (!Active || target == null) return true;
             source = ResolveSpellSource(spell, target, source);
             CombatActorClass targetClass = Classify(target.Myself);
             CombatActorClass sourceClass = Classify(source);
+
+            // Mana/resource restoration is containment-sensitive too. The previous early return for
+            // isMana let participant group-resource effects leak to unrelated actors. Self resource
+            // effects stay native; cross/third-party resource assistance is refused per target.
+            if (isMana)
+            {
+                if (IsDuelParticipantClass(targetClass))
+                {
+                    if (_state == DuelLifecycleState.Active && source == target.Myself && IsDuelParticipantClass(sourceClass))
+                        return true;
+                    if (sourceClass == CombatActorClass.OutsideHostile) return true;
+                    result = 0;
+                    DiagnosticRecord("resource_effect_blocked source=" + DamageSourceRole(source) +
+                        " target=" + DamageTargetRole(target.Myself));
+                    return false;
+                }
+                if (IsDuelParticipantClass(sourceClass))
+                {
+                    result = 0;
+                    NotifyUnsafeAreaBystander();
+                    return false;
+                }
+                return true;
+            }
 
             if (IsDuelParticipantClass(targetClass))
             {
@@ -1963,16 +2748,20 @@ namespace ErenshorDuel
                     state = BeginHealCapture(target);
                     return true;
                 }
-                Diagnostic("third_party_heal_blocked path=attributed source=" + DescribeActor(source) +
+                // Hostile-world healing is bizarre but remains native rather than being confused
+                // with friendly assistance. Ordinary friendly/protected/unknown help is blocked.
+                if (sourceClass == CombatActorClass.OutsideHostile) return true;
+                DiagnosticRecord("third_party_heal_blocked path=attributed source=" + DescribeActor(source) +
                     " target=" + DescribeActor(target.Myself) + " spell=" + SafeLabel(spell == null ? null : spell.name));
                 result = 0;
-                return false; // no cross-healing and no friendly third-party healing.
+                return false;
             }
 
             if (IsDuelParticipantClass(sourceClass))
             {
                 result = 0;
-                return false; // duelists cannot heal third parties during the match.
+                NotifyUnsafeAreaBystander();
+                return false;
             }
             return true;
         }
@@ -1998,7 +2787,8 @@ namespace ErenshorDuel
                 maximum, state.Before, state.Target.CurrentHP, "selfOnly=true");
         }
 
-        internal static bool AllowStatusEffect(Stats target, Spell spell, Character source, ref int result, string eventSource)
+        internal static bool BeginStatusEffect(Stats target, Spell spell, Character source, ref int result,
+            string eventSource, ref StatusEffectIngressState state)
         {
             if (!Active || target == null) return true;
             source = ResolveSpellSource(spell, target, source);
@@ -2008,16 +2798,23 @@ namespace ErenshorDuel
             if (IsDuelParticipantClass(sourceClass))
             {
                 if (_state != DuelLifecycleState.Active) { result = 0; return false; }
-                if (target.Myself == source) return IsSelfContainedDuelCast(spell) || BlockStatusEffect(ref result);
+                if (target.Myself == source)
+                {
+                    bool containedSelf = IsAreaSpell(spell)
+                        ? IsAreaStructurallyContainable(spell) && IsKnownBeneficialPayload(spell)
+                        : IsSelfContainedDuelCast(spell);
+                    return containedSelf || BlockStatusEffect(ref result);
+                }
                 if (IsDuelParticipantClass(targetClass) && IsSafeDuelOffense(spell)) return true;
+                if (targetClass == CombatActorClass.OutsideHostile && IsSafeDuelOffense(spell)) return true;
                 result = 0;
+                if (targetClass == CombatActorClass.ProtectedNonParticipant || targetClass == CombatActorClass.Unknown)
+                    NotifyUnsafeAreaBystander();
                 return false;
             }
 
             if (IsDuelParticipantClass(targetClass) && IsFriendlyPartyClass(sourceClass))
             {
-                // A DoT or debuff landed by an admitted pet is part of the match; anything else a
-                // friendly actor tries to apply to a duelist is interference.
                 if (IsAdmittedPetEngagement(source, target.Myself) && IsSafeDuelOffense(spell)) return true;
                 result = 0;
                 return false;
@@ -2025,23 +2822,46 @@ namespace ErenshorDuel
 
             if (IsDuelParticipantClass(targetClass) && sourceClass == CombatActorClass.OutsideHostile)
             {
-                Cancel(eventSource, source, target.Myself, target.Myself,
-                    "Duel cancelled because an outside actor directly applied an effect to a duelist.");
+                // Apply the hostile-world status effect against the actor's real HP/effect baseline,
+                // then adopt the resulting native state before remirroring virtual duel health.
+                int realHp = RealLedgerHp(target.Myself);
+                state = new StatusEffectIngressState
+                {
+                    Target = target.Myself,
+                    PreserveWorldReal = true,
+                    RealBefore = realHp,
+                    Spell = spell
+                };
+                try { target.CurrentHP = Math.Max(1, realHp); } catch { }
+                _lastDamageDiagnostic = "source=" + SafeLabel(eventSource) +
+                    " sourceRole=hostile_world targetRole=" + ParticipantRole(target.Myself) +
+                    " authority=real_world effect=true virtualized=false realEffectPreserved=pending_native";
                 return true;
             }
 
-            if (IsDuelParticipantClass(targetClass) && sourceClass == CombatActorClass.Unknown)
+            if (IsDuelParticipantClass(targetClass) &&
+                (sourceClass == CombatActorClass.ProtectedNonParticipant || sourceClass == CombatActorClass.Unknown))
             {
-                // An unresolved source (e.g. a party/group buff applied without a tracked
-                // caster, which is common for the 3-arg AddStatusEffect overload) is not
-                // evidence of outside interference by itself. Block the effect during the
-                // duel instead of ending it, matching how a confirmed friendly source is
-                // handled just above.
                 result = 0;
                 return false;
             }
 
             return true;
+        }
+
+        internal static void FinishStatusEffect(StatusEffectIngressState state)
+        {
+            if (state == null || state.Completed || !state.PreserveWorldReal || state.Target == null) return;
+            state.Completed = true;
+            int after = state.RealBefore;
+            try { if (state.Target.MyStats != null) after = Math.Max(0, state.Target.MyStats.CurrentHP); } catch { }
+            SetRealLedgerHp(state.Target, after);
+            AdoptWorldStatusEffectSlots(state.Target, state.Spell);
+            _lastDamageDiagnostic = "source=status_effect sourceRole=hostile_world targetRole=" + ParticipantRole(state.Target) +
+                " authority=real_world effect=true virtualized=false realBefore=" + state.RealBefore +
+                " realAfter=" + after + " realEffectPreserved=true";
+            DiagnosticRecord("world_effect " + _lastDamageDiagnostic);
+            if (DuelLifecyclePolicy.IsCombatActive(_state) && IsAlive(state.Target)) MirrorVirtualHealth();
         }
 
         private static Character ResolveSpellSource(Spell spell, Stats target, Character supplied)
@@ -2290,7 +3110,7 @@ namespace ErenshorDuel
             string playerScene = player == null || player.gameObject == null ? "none" : SafeSceneName(player.gameObject);
             bool playerStable = IsAlive(player);
 
-            Diagnostic("diag=summary player_stable=" + playerStable + " player_scene=" + playerScene +
+            DiagnosticRecord("diag=summary player_stable=" + playerStable + " player_scene=" + playerScene +
                 " active_zone=" + activeZone);
 
             int total = 0;
@@ -2338,9 +3158,15 @@ namespace ErenshorDuel
 
             Diagnostic("diag=totals simPlayers=" + total + " local=" + local + " eligible=" + eligible);
 
+            DiagnosticRecord("diag=last_spell_admission " + _lastSpellAdmission);
+            DiagnosticRecord("diag=last_damage " + _lastDamageDiagnostic);
+            DiagnosticRecord("diag=last_aoe " + _lastAoeDiagnostic);
+
             return "[Practice Duel] diag: " + total + " SimPlayer(s), " + local + " local, " + eligible +
                 " eligible. active_zone=" + activeZone + " player_scene=" + playerScene +
-                " player_stable=" + playerStable + " (full per-candidate detail in the Lunaris log)";
+                " player_stable=" + playerStable + " | lastSpell: " + _lastSpellAdmission +
+                " | lastDamage: " + _lastDamageDiagnostic + " | lastAoE: " + _lastAoeDiagnostic +
+                " (full per-candidate detail in the Lunaris log)";
         }
 
         private static DuelEligibilityDecision EvaluateEligibility(SimPlayer target, Character player,
@@ -2663,6 +3489,28 @@ namespace ErenshorDuel
             Diagnostic(message);
         }
 
+        // Diagnostic() routes the whole message through SafeLabel, which caps at 120 characters -
+        // correct for a single untrusted label, but it silently truncated the multi-field spell
+        // admission record mid-field. This variant keeps the properties that actually matter for
+        // safety (newlines stripped so a record can never forge extra log lines, and a hard length
+        // ceiling) while leaving room for a complete record whose individual fields are already
+        // sanitized and bounded at the point they are read.
+        private static void DiagnosticRecord(string message)
+        {
+            try
+            {
+                if (ErenshorDuelPlugin.Instance == null) return;
+                string clean = (message ?? string.Empty).Replace('\r', ' ').Replace('\n', ' ').Trim();
+                if (clean.Length == 0) return;
+                // 400 was still cutting the tail off the widest records: a live spell_commit
+                // measured 424 characters and lost startSpellEntered/startSpellResult, the
+                // fields that say whether native StartSpell actually ran and what it returned.
+                if (clean.Length > 900) clean = clean.Substring(0, 900);
+                ErenshorDuelPlugin.Instance.Diagnostic("[Practice Duel] " + clean);
+            }
+            catch { }
+        }
+
         private static void Diagnostic(string message)
         {
             try
@@ -2711,31 +3559,6 @@ namespace ErenshorDuel
             return DuelSafetyPolicy.PartyScopeStillMatches(_firstSimWasParty, firstPartyNow);
         }
 
-        private static bool TryGetExternalAttacker(out NPC attacker, out Character target)
-        {
-            attacker = null;
-            target = null;
-            try
-            {
-                if (GameData.AttackingPlayer == null) return false;
-                foreach (NPC npc in GameData.AttackingPlayer)
-                {
-                    if (npc == null || npc.CurrentAggroTarget == null) continue;
-                    CombatActorClass actorClass = Classify(npc);
-                    CombatActorClass targetClass = Classify(npc.CurrentAggroTarget);
-                    DuelOutsideEffectDisposition directIngress = DuelSafetyPolicy.DirectHostileIngress(
-                        IsDuelParticipantClass(targetClass), IsFriendlyPartyClass(actorClass),
-                        actorClass == CombatActorClass.OutsideHostile, actorClass == CombatActorClass.Unknown);
-                    if (directIngress != DuelOutsideEffectDisposition.Cancel) continue;
-                    attacker = npc;
-                    target = npc.CurrentAggroTarget;
-                    return true;
-                }
-            }
-            catch { }
-            return false;
-        }
-
         private static bool IsCampActive(bool forceIntegrationRefresh)
         {
             try { if (GameData.PlayerControl != null && GameData.PlayerControl.Sitting) return true; } catch { }
@@ -2763,8 +3586,9 @@ namespace ErenshorDuel
             catch { }
             Character actor = NpcCharacter(npc);
             if (actor != null) return Classify(actor);
-            try { return npc.SummonedByPlayer ? CombatActorClass.Unknown : CombatActorClass.OutsideHostile; }
-            catch { return CombatActorClass.Unknown; }
+            // Without a Character we cannot prove faction/vendor/resource semantics. Fail closed;
+            // do not promote every anonymous NPC component to a hostile-world authority.
+            return CombatActorClass.Unknown;
         }
 
         private static Character NpcCharacter(NPC npc)
@@ -2806,7 +3630,40 @@ namespace ErenshorDuel
             // NPC.SummonedByPlayer for summoned pets. If a summoned actor has lost its Master,
             // ownership is ambiguous: keep it Unknown rather than inventing an owner.
             try { if (npc != null && npc.SummonedByPlayer) return CombatActorClass.Unknown; } catch { }
-            return npc != null ? CombatActorClass.OutsideHostile : CombatActorClass.Unknown;
+            if (npc != null && IsVerifiedHostileWorldActor(actor, npc)) return CombatActorClass.OutsideHostile;
+            if (npc != null && IsKnownProtectedWorldActor(actor, npc)) return CombatActorClass.ProtectedNonParticipant;
+            return CombatActorClass.Unknown;
+        }
+
+        // Same-snapshot native fields used by other current modules to distinguish ordinary hostile
+        // world NPCs from Sims, vendors, villagers, resource objects and summons. Practice Duel uses
+        // this only as an authority gate: ambiguous actors fail closed instead of being promoted to
+        // "hostile" merely because they have an NPC component.
+        private static bool IsVerifiedHostileWorldActor(Character actor, NPC npc)
+        {
+            if (actor == null || npc == null) return false;
+            try
+            {
+                if (!actor.Alive || actor.Master != null || actor.Invulnerable || actor.isVendor) return false;
+                if (npc.SimPlayer || npc.ThisSim != null || npc.NeverAggro || npc.MiningNode || npc.TreasureChest || npc.SummonedByPlayer) return false;
+                if (actor.MyFaction == Character.Faction.Player || actor.MyFaction == Character.Faction.PC ||
+                    actor.MyFaction == Character.Faction.Villager || actor.MyFaction == Character.Faction.DEBUG) return false;
+                return true;
+            }
+            catch { return false; }
+        }
+
+        private static bool IsKnownProtectedWorldActor(Character actor, NPC npc)
+        {
+            if (actor == null || npc == null) return false;
+            try
+            {
+                if (actor.isVendor || actor.Master != null || npc.SimPlayer || npc.ThisSim != null ||
+                    npc.NeverAggro || npc.MiningNode || npc.TreasureChest || npc.SummonedByPlayer) return true;
+                return actor.MyFaction == Character.Faction.Player || actor.MyFaction == Character.Faction.PC ||
+                       actor.MyFaction == Character.Faction.Villager || actor.MyFaction == Character.Faction.DEBUG;
+            }
+            catch { return false; }
         }
 
         private static bool IsVerifiedPartyCharacter(Character actor)
@@ -2861,6 +3718,42 @@ namespace ErenshorDuel
         private static bool IsDuelParticipantClass(CombatActorClass actorClass)
         {
             return actorClass == CombatActorClass.DuelParticipant || actorClass == CombatActorClass.LocalPlayer;
+        }
+
+        private static string ParticipantRole(Character actor)
+        {
+            if (actor == _player) return _spectatorDuel ? "duel_first_sim" : "duel_player";
+            if (actor == _sim) return "duel_opponent";
+            return DamageTargetRole(actor);
+        }
+
+        private static string DamageSourceRole(Character actor)
+        {
+            Character principal = DuelPrincipal(actor);
+            if (principal != null) return actor == principal ? ParticipantRole(principal) : "duel_owned_pet";
+            CombatActorClass c = Classify(actor);
+            if (c == CombatActorClass.OutsideHostile) return "hostile_world";
+            if (c == CombatActorClass.ProtectedNonParticipant) return "protected_nonparticipant";
+            if (c == CombatActorClass.GroupedLocalSim || c == CombatActorClass.GroupedSimOwnedPet) return "friendly_nonparticipant";
+            return c == CombatActorClass.Unknown ? "unknown" : c.ToString();
+        }
+
+        private static string DamageTargetRole(Character actor)
+        {
+            if (actor == _player || actor == _sim) return ParticipantRole(actor);
+            CombatActorClass c = Classify(actor);
+            if (c == CombatActorClass.OutsideHostile) return "hostile_world";
+            if (c == CombatActorClass.ProtectedNonParticipant) return "protected_nonparticipant";
+            if (c == CombatActorClass.GroupedLocalSim || c == CombatActorClass.GroupedSimOwnedPet) return "friendly_nonparticipant";
+            return c == CombatActorClass.Unknown ? "unknown" : c.ToString();
+        }
+
+        private static void NotifyUnsafeAreaBystander()
+        {
+            float now = Time.unscaledTime;
+            if (now - _lastBystanderMessageAt < 1.5f) return;
+            _lastBystanderMessageAt = now;
+            Say("[Practice Duel] Can't use that here — someone else is in the blast.", "yellow");
         }
 
         private static bool IsPlayerPartySim(SimPlayer sim)
@@ -3047,6 +3940,7 @@ namespace ErenshorDuel
             try { RestoreInitialNearbyEnemyMembership(); } catch { }
             try { RestoreNativeHitState(_nativeDamageInFlight); } catch { }
             _nativeDamageInFlight = null;
+            _standaloneWorldDamageInFlight = null;
             _effectTickOwner = null;
             _player = null;
             _sim = null;
@@ -3083,6 +3977,8 @@ namespace ErenshorDuel
             SimInitialEffects.Clear();
             PlayerInitialEffectState.Clear();
             SimInitialEffectState.Clear();
+            PlayerWorldEffectSlots.Clear();
+            SimWorldEffectSlots.Clear();
             _playerInitialSpellShield = 0;
             _simInitialSpellShield = 0;
             _playerInitialLastHitBy = null;
@@ -3214,9 +4110,20 @@ namespace ErenshorDuel
     internal static class DuelDamageShieldPatch
     {
         [HarmonyPrefix]
-        private static bool Prefix(Character __instance, int __0, Stats __1)
+        private static bool Prefix(Character __instance, int __0, Stats __1, ref DuelController.StandaloneWorldDamageState __state)
         {
-            return DuelController.HandleDamageShield(__instance, __0, __1);
+            return DuelController.BeginDamageShield(__instance, __0, __1, ref __state);
+        }
+        [HarmonyPostfix]
+        private static void Postfix(DuelController.StandaloneWorldDamageState __state)
+        {
+            DuelController.FinishDamageShield(__state);
+        }
+        [HarmonyFinalizer]
+        private static Exception Finalizer(Exception __exception, DuelController.StandaloneWorldDamageState __state)
+        {
+            DuelController.FinishDamageShield(__state);
+            return __exception;
         }
     }
 
@@ -3393,9 +4300,22 @@ namespace ErenshorDuel
     internal static class DuelPartySpellStartPatch
     {
         [HarmonyPrefix]
-        private static bool Prefix(CastSpell __instance, Spell __0, Stats __1, ref bool __result)
+        private static bool Prefix(CastSpell __instance, Spell __0, ref Stats __1, ref bool __result, ref DuelController.SpellStartState __state)
         {
-            return DuelController.AllowSpellStart(__instance, __0, __1, ref __result, "Harmony.CastSpell.StartSpell/2");
+            return DuelController.BeginSpellStart(__instance, __0, ref __1, ref __result, "Harmony.CastSpell.StartSpell/2", ref __state);
+        }
+
+        [HarmonyPostfix]
+        private static void Postfix(bool __result, DuelController.SpellStartState __state)
+        {
+            DuelController.FinishSpellStart(__state, __result);
+        }
+
+        [HarmonyFinalizer]
+        private static Exception Finalizer(Exception __exception, bool __result, DuelController.SpellStartState __state)
+        {
+            DuelController.FinishSpellStart(__state, __result);
+            return __exception;
         }
     }
 
@@ -3403,9 +4323,22 @@ namespace ErenshorDuel
     internal static class DuelSpellStartTimedPatch
     {
         [HarmonyPrefix]
-        private static bool Prefix(CastSpell __instance, Spell __0, Stats __1, ref bool __result)
+        private static bool Prefix(CastSpell __instance, Spell __0, ref Stats __1, ref bool __result, ref DuelController.SpellStartState __state)
         {
-            return DuelController.AllowSpellStart(__instance, __0, __1, ref __result, "Harmony.CastSpell.StartSpell/3");
+            return DuelController.BeginSpellStart(__instance, __0, ref __1, ref __result, "Harmony.CastSpell.StartSpell/3", ref __state);
+        }
+
+        [HarmonyPostfix]
+        private static void Postfix(bool __result, DuelController.SpellStartState __state)
+        {
+            DuelController.FinishSpellStart(__state, __result);
+        }
+
+        [HarmonyFinalizer]
+        private static Exception Finalizer(Exception __exception, bool __result, DuelController.SpellStartState __state)
+        {
+            DuelController.FinishSpellStart(__state, __result);
+            return __exception;
         }
     }
 
@@ -3413,9 +4346,22 @@ namespace ErenshorDuel
     internal static class DuelSpellStartResonatePatch
     {
         [HarmonyPrefix]
-        private static bool Prefix(CastSpell __instance, Spell __0, Stats __1, ref bool __result)
+        private static bool Prefix(CastSpell __instance, Spell __0, ref Stats __1, ref bool __result, ref DuelController.SpellStartState __state)
         {
-            return DuelController.AllowSpellStart(__instance, __0, __1, ref __result, "Harmony.CastSpell.StartSpell/4");
+            return DuelController.BeginSpellStart(__instance, __0, ref __1, ref __result, "Harmony.CastSpell.StartSpell/4", ref __state);
+        }
+
+        [HarmonyPostfix]
+        private static void Postfix(bool __result, DuelController.SpellStartState __state)
+        {
+            DuelController.FinishSpellStart(__state, __result);
+        }
+
+        [HarmonyFinalizer]
+        private static Exception Finalizer(Exception __exception, bool __result, DuelController.SpellStartState __state)
+        {
+            DuelController.FinishSpellStart(__state, __result);
+            return __exception;
         }
     }
 
@@ -3423,9 +4369,22 @@ namespace ErenshorDuel
     internal static class DuelSpellStartScaledPatch
     {
         [HarmonyPrefix]
-        private static bool Prefix(CastSpell __instance, Spell __0, Stats __1, ref bool __result)
+        private static bool Prefix(CastSpell __instance, Spell __0, ref Stats __1, ref bool __result, ref DuelController.SpellStartState __state)
         {
-            return DuelController.AllowSpellStart(__instance, __0, __1, ref __result, "Harmony.CastSpell.StartSpell/5");
+            return DuelController.BeginSpellStart(__instance, __0, ref __1, ref __result, "Harmony.CastSpell.StartSpell/5", ref __state);
+        }
+
+        [HarmonyPostfix]
+        private static void Postfix(bool __result, DuelController.SpellStartState __state)
+        {
+            DuelController.FinishSpellStart(__state, __result);
+        }
+
+        [HarmonyFinalizer]
+        private static Exception Finalizer(Exception __exception, bool __result, DuelController.SpellStartState __state)
+        {
+            DuelController.FinishSpellStart(__state, __result);
+            return __exception;
         }
     }
 
@@ -3433,9 +4392,22 @@ namespace ErenshorDuel
     internal static class DuelSpellProcStartPatch
     {
         [HarmonyPrefix]
-        private static bool Prefix(CastSpell __instance, Spell __0, Stats __1, ref bool __result)
+        private static bool Prefix(CastSpell __instance, Spell __0, ref Stats __1, ref bool __result, ref DuelController.SpellStartState __state)
         {
-            return DuelController.AllowSpellStart(__instance, __0, __1, ref __result, "Harmony.CastSpell.StartSpellFromProc");
+            return DuelController.BeginSpellStart(__instance, __0, ref __1, ref __result, "Harmony.CastSpell.StartSpellFromProc", ref __state);
+        }
+
+        [HarmonyPostfix]
+        private static void Postfix(bool __result, DuelController.SpellStartState __state)
+        {
+            DuelController.FinishSpellStart(__state, __result);
+        }
+
+        [HarmonyFinalizer]
+        private static Exception Finalizer(Exception __exception, bool __result, DuelController.SpellStartState __state)
+        {
+            DuelController.FinishSpellStart(__state, __result);
+            return __exception;
         }
     }
 
@@ -3443,9 +4415,22 @@ namespace ErenshorDuel
     internal static class DuelSpellNoAnimPatch
     {
         [HarmonyPrefix]
-        private static bool Prefix(CastSpell __instance, Spell __0, Stats __1, ref bool __result)
+        private static bool Prefix(CastSpell __instance, Spell __0, ref Stats __1, ref bool __result, ref DuelController.SpellStartState __state)
         {
-            return DuelController.AllowSpellStart(__instance, __0, __1, ref __result, "Harmony.CastSpell.StartSpellNoAnim");
+            return DuelController.BeginSpellStart(__instance, __0, ref __1, ref __result, "Harmony.CastSpell.StartSpellNoAnim", ref __state);
+        }
+
+        [HarmonyPostfix]
+        private static void Postfix(bool __result, DuelController.SpellStartState __state)
+        {
+            DuelController.FinishSpellStart(__state, __result);
+        }
+
+        [HarmonyFinalizer]
+        private static Exception Finalizer(Exception __exception, bool __result, DuelController.SpellStartState __state)
+        {
+            DuelController.FinishSpellStart(__state, __result);
+            return __exception;
         }
     }
 
@@ -3509,17 +4494,24 @@ namespace ErenshorDuel
         private static void Postfix(DuelController.HealCapture __state) { DuelController.FinishHeal(__state); }
     }
 
-    // The 3-arg overload (no explicit Character caster) is also live game API and is hooked by the
-    // vendored ErenshorCoop mod, confirming it is a real path effects can arrive through. Without
-    // this patch, any effect applied via this overload bypasses every duel filter/cancellation
-    // check. Source resolves via AllowStatusEffect's existing ResolveSpellSource fallback.
+    // The 3-arg overload (no explicit Character caster) is also live game API. Source resolution
+    // falls back to the current cast/self-application rules. All overloads retain a small state so a
+    // hostile-world effect can update the real-world baseline after native application.
     [HarmonyPatch(typeof(Stats), "AddStatusEffect", new Type[] { typeof(Spell), typeof(bool), typeof(int) })]
     internal static class DuelBasicStatusEffectPatch
     {
         [HarmonyPrefix]
-        private static bool Prefix(Stats __instance, Spell __0, ref int __result)
+        private static bool Prefix(Stats __instance, Spell __0, ref int __result, ref DuelController.StatusEffectIngressState __state)
         {
-            return DuelController.AllowStatusEffect(__instance, __0, null, ref __result, "Harmony.Stats.AddStatusEffect/3");
+            return DuelController.BeginStatusEffect(__instance, __0, null, ref __result, "Harmony.Stats.AddStatusEffect/3", ref __state);
+        }
+        [HarmonyPostfix]
+        private static void Postfix(DuelController.StatusEffectIngressState __state) { DuelController.FinishStatusEffect(__state); }
+        [HarmonyFinalizer]
+        private static Exception Finalizer(Exception __exception, DuelController.StatusEffectIngressState __state)
+        {
+            DuelController.FinishStatusEffect(__state);
+            return __exception;
         }
     }
 
@@ -3527,9 +4519,17 @@ namespace ErenshorDuel
     internal static class DuelStatusEffectPatch
     {
         [HarmonyPrefix]
-        private static bool Prefix(Stats __instance, Spell __0, Character __3, ref int __result)
+        private static bool Prefix(Stats __instance, Spell __0, Character __3, ref int __result, ref DuelController.StatusEffectIngressState __state)
         {
-            return DuelController.AllowStatusEffect(__instance, __0, __3, ref __result, "Harmony.Stats.AddStatusEffect/4");
+            return DuelController.BeginStatusEffect(__instance, __0, __3, ref __result, "Harmony.Stats.AddStatusEffect/4", ref __state);
+        }
+        [HarmonyPostfix]
+        private static void Postfix(DuelController.StatusEffectIngressState __state) { DuelController.FinishStatusEffect(__state); }
+        [HarmonyFinalizer]
+        private static Exception Finalizer(Exception __exception, DuelController.StatusEffectIngressState __state)
+        {
+            DuelController.FinishStatusEffect(__state);
+            return __exception;
         }
     }
 
@@ -3537,9 +4537,17 @@ namespace ErenshorDuel
     internal static class DuelTimedStatusEffectPatch
     {
         [HarmonyPrefix]
-        private static bool Prefix(Stats __instance, Spell __0, Character __3, ref int __result)
+        private static bool Prefix(Stats __instance, Spell __0, Character __3, ref int __result, ref DuelController.StatusEffectIngressState __state)
         {
-            return DuelController.AllowStatusEffect(__instance, __0, __3, ref __result, "Harmony.Stats.AddStatusEffect/5");
+            return DuelController.BeginStatusEffect(__instance, __0, __3, ref __result, "Harmony.Stats.AddStatusEffect/5", ref __state);
+        }
+        [HarmonyPostfix]
+        private static void Postfix(DuelController.StatusEffectIngressState __state) { DuelController.FinishStatusEffect(__state); }
+        [HarmonyFinalizer]
+        private static Exception Finalizer(Exception __exception, DuelController.StatusEffectIngressState __state)
+        {
+            DuelController.FinishStatusEffect(__state);
+            return __exception;
         }
     }
 
@@ -3547,10 +4555,19 @@ namespace ErenshorDuel
     internal static class DuelUncheckedStatusEffectPatch
     {
         [HarmonyPrefix]
-        private static bool Prefix(Stats __instance, Spell __0, Character __3)
+        private static bool Prefix(Stats __instance, Spell __0, Character __3, ref DuelController.StatusEffectIngressState __state)
         {
             int ignoredResult = 0;
-            return DuelController.AllowStatusEffect(__instance, __0, __3, ref ignoredResult, "Harmony.Stats.AddStatusEffectNoChecks");
+            return DuelController.BeginStatusEffect(__instance, __0, __3, ref ignoredResult, "Harmony.Stats.AddStatusEffectNoChecks", ref __state);
+        }
+        [HarmonyPostfix]
+        private static void Postfix(DuelController.StatusEffectIngressState __state) { DuelController.FinishStatusEffect(__state); }
+        [HarmonyFinalizer]
+        private static Exception Finalizer(Exception __exception, DuelController.StatusEffectIngressState __state)
+        {
+            DuelController.FinishStatusEffect(__state);
+            return __exception;
         }
     }
+
 }

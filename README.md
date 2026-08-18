@@ -1,4 +1,4 @@
-# Erenshor Practice Duels 0.4.1
+# Erenshor Practice Duels 0.4.5
 
 Part of the **Forgotten Roads for Erenshor** mod collection.
 
@@ -9,11 +9,11 @@ practice match does not become ordinary gameplay combat.
 
 ## Status: playable-state release candidate
 
-The combat boundary remains native-adjacent: Erenshor computes admitted duel damage, Duel contains the result in virtual health, and terminal cleanup restores only state Duel still owns. Lifecycle is explicit: `Idle -> Preparing -> Countdown -> Active -> Cleaning -> Idle`. `Cleaning` is a real two-second teardown gate, so another challenge cannot overlap a still-running target/aggro scrub.
+The combat boundary remains native-adjacent: Erenshor computes admitted duel damage through its normal `DamageMe` / `MagicDamageMe` / `BleedDamageMe` path; a scoped `Stats.ReduceHP` Prefix captures the final post-mitigation reduction for the exact Duel participant transaction and suppresses only that real/mirrored HP write; Duel then applies the captured amount once to virtual health. Version 0.4.5 preserves the live-proven 0.4.4 scoped damage transaction and does **not** use synthetic `int.MaxValue` HP headroom. Lifecycle remains explicit: `Idle -> Preparing -> Countdown -> Active -> Cleaning -> Idle`. `Cleaning` is a real two-second teardown gate, so another challenge cannot overlap a still-running target/aggro scrub.
 
-Terminal restore is ownership-aware. If native gameplay selects a new unrelated player/NPC target during teardown, Duel does not replay an older target over it, and the post-duel autoattack scrub releases ownership immediately. Party-scope changes, participant invalidation, zoning, and direct outside hostile ingress cancel deterministically. Idle shutdown remains quiet.
+Terminal restore is ownership-aware. If native gameplay selects a new unrelated player/NPC target during teardown, Duel does not replay an older target over it, and the post-duel autoattack scrub releases ownership immediately. Party-scope changes, participant invalidation, and zoning still cancel deterministically. Verified ordinary hostile-world PvE is intentionally different: it may overlap an active duel, remains fully native/real, and is never translated into virtual Duel HP. Friendly/protected/unknown third-party interference remains contained. Idle shutdown remains quiet.
 
-The deterministic self-test suite and installed-reference build pass against the current local Erenshor/Lunaris installation. Version 0.4.1 also routes both normal and emergency terminal paths through the same party Guard/follow restoration helper. Full live verification remains required for winner, timeout, manual stop, immediate repeat, hostile interruption, participant invalidation, zoning, and unload/reload.
+The deterministic self-test suite is wired for the current source snapshot, but it could not be executed in this sandbox because no PowerShell/C# compiler is installed. A fresh installed-reference build and plugin-identity audit are also pending because the supplied packet does not include the current game `Assembly-CSharp.dll`. Version 0.4.5 leaves the live-proven 0.4.4 `Stats.ReduceHP` capture, nested damage stack, world-real ledger, declared-self spell repair, actor/effect-aware AoE containment, status/effect restoration, lifecycle, and cleanup semantics intact. Its only combat-semantic expansion is a narrow Active-Duel adaptation for ordinary single-target Heal spells such as Minor Healing: when the exact opponent is still selected/passed to `StartSpell`, the Harmony target argument is changed to the caster’s own `Stats` without changing `PlayerControl.CurrentTarget`; native Erenshor still owns cast time, animation, mana, cooldown, and heal amount. Full live verification remains required for repeated melee, Minor Healing with the opponent selected, declared-self spells, lifesteal, Sim healing, AoE with hostile/protected bystanders, legitimate yield, immediate repeat, post-duel vanilla combat, zoning, and unload/reload.
 
 ## What it does
 
@@ -23,7 +23,7 @@ The deterministic self-test suite and installed-reference build pass against the
 - Contains verified native melee, skill, spell, healing, pet, effect, and damage paths inside the
   virtual-health duel boundary; unsupported third-party actions fail closed.
 - Excludes remote COOP humans and network-owned Sims, and cancels safely for zoning, distance,
-  camp activation, hostile interference, participant loss, manual stops, and internal errors.
+  camp activation, participant loss, unsafe friendly/unknown interference, manual stops, and internal errors. Verified hostile-world enemies are not treated as prohibited interference merely for being present, taking AoE damage, or attacking a duelist.
 - Restores captured temporary combat state on teardown, including health, effects, targets, aggro, pets, and related temporary state where supported by the current source. Restoration is ownership-aware: newer unrelated target/combat state is preserved instead of blindly overwritten by a pre-duel snapshot. A challenge is rejected if native autoattack evidence is unavailable or player autoattack was already active, so Duel never has to reconstruct a native attack loop that predates the practice match.
 
 Practice Duels grants no XP or loot, changes no faction, creates no real PvP, and does not make
@@ -41,7 +41,7 @@ Idle
   -> Idle          all duel and post-cleanup ownership released
 ```
 
-Any terminal reason from Preparing, Countdown, or Active enters Cleaning. New challenges are rejected during Cleaning. Zone transitions, participant loss, party-scope changes, verified/direct outside combat, manual stop, unload, and shutdown all converge on the same terminal restoration boundary.
+Any terminal reason from Preparing, Countdown, or Active enters Cleaning. New challenges are rejected during Cleaning. Zone transitions, participant loss, party-scope changes, manual stop, unload, and shutdown all converge on the same terminal restoration boundary. Verified hostile-world combat does not cancel solely for overlapping the duel; its HP/effect consequences remain native and are carried in a separate real-world ledger.
 
 ## Commands
 
@@ -86,8 +86,8 @@ cycle.
 - **[Erenshor COOP](https://github.com/MizukiBelhi/ErenshorCoop) by MizukiBelhi** is a technical
   reference and compatibility target for remote-human and networked-Sim detection.
 
-This project was developed with substantial AI-assisted coding support, guided by design, testing,
-playtesting, audits, and iteration. It is an unofficial community mod and is not affiliated with
+This project is guided by design, testing, playtesting, audits, and iteration. It is an unofficial
+community mod and is not affiliated with
 or endorsed by Erenshor's developer.
 
 
@@ -95,6 +95,6 @@ or endorsed by Erenshor's developer.
 
 Forgotten Roads Hub is **optional**. The mod exposes a versioned `DuelControlApi`/Aura surface without a Hub assembly reference or load-order dependency. The descriptor reports concise duel status plus an eligible-local-candidate count. Its action transport remains exactly the authoritative operations already supported by the ControlApi: `challenge` with an explicit Sim-name argument and `stop`.
 
-Practice Duels intentionally has no dedicated module panel or standalone launcher; `/eduel` and existing contextual integrations remain standalone. Remote COOP humans and unrelated actors remain excluded by the same eligibility path used outside Hub.
+Practice Duels keeps combat UI small, but the shared retained fallback entry point provides mouse discoverability when Forgotten Roads Hub is absent/unavailable and hides while a healthy Hub owns primary access. `/eduel` remains a compatibility control. Remote COOP humans and unrelated actors remain excluded by the same eligibility path used outside Hub.
 
 The current Suite Hub renderer can transport two-argument actions but does not yet render arbitrary argument-entry/action controls on a module page. Therefore the Duel provider advertises `challenge(name)`/`stop` correctly, but this workstream does not invent a fake target selector or modify Hub to surface them as buttons.

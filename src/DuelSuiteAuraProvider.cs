@@ -77,7 +77,7 @@ namespace ErenshorDuel
                 AppendField(sb, "summary", s.Active ? "Duel in progress" : "No active duel");
                 AppendField(sb, "status", DuelControlApi.GetStatus());
                 AppendField(sb, "eligibleCount", s.EligibleNames == null ? "0" : s.EligibleNames.Length.ToString());
-                AppendField(sb, "actions", "challenge,stop");
+                AppendField(sb, "actions", "openPanel,closePanel,challenge,stop");
                 return sb.ToString();
             }
             catch (Exception ex)
@@ -95,6 +95,10 @@ namespace ErenshorDuel
         {
             try
             {
+                if (string.Equals(actionId, "openPanel", StringComparison.Ordinal))
+                    return DuelControlApi.OpenPanel() ? "ok" : "rejected";
+                if (string.Equals(actionId, "closePanel", StringComparison.Ordinal))
+                    return DuelControlApi.ClosePanel() ? "ok" : "rejected";
                 if (string.Equals(actionId, "challenge", StringComparison.Ordinal))
                 {
                     if (string.IsNullOrWhiteSpace(argument)) return "missing argument";

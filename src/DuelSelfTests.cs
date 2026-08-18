@@ -4,7 +4,10 @@ namespace ErenshorDuel
     {
         internal static string RunAll()
         {
-            string result = DuelLifecyclePolicy.RunSelfTests();
+            string result = DuelCombatSemanticsPolicy.RunSelfTests();
+            if (!result.StartsWith("PASS")) return result;
+
+            result = DuelLifecyclePolicy.RunSelfTests();
             if (!result.StartsWith("PASS")) return result;
 
             result = DuelChallengePolicy.RunSelfTests();
@@ -26,6 +29,9 @@ namespace ErenshorDuel
             if (!result.StartsWith("PASS")) return result;
 
             result = DeepSimsCompatibility.RunSelfTests();
+            if (!result.StartsWith("PASS")) return result;
+
+            result = DuelSpellAdmissionPolicy.RunSelfTests();
             if (!result.StartsWith("PASS")) return result;
 
             return "PASS deterministic duel self-tests";

@@ -6,7 +6,7 @@ param(
 $ErrorActionPreference = "Stop"
 $ScriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $sourceHead = "unavailable"
-try { $sourceHead = (& git -C $ScriptRoot rev-parse HEAD).Trim() } catch { }
+try { $sourceHead = (& git -c "safe.directory=$ScriptRoot" -c core.excludesFile= -C $ScriptRoot rev-parse HEAD).Trim() } catch { }
 
 function Find-Game([string]$Explicit) {
     if ($Explicit -and (Test-Path (Join-Path $Explicit "Erenshor.exe"))) { return (Resolve-Path $Explicit).Path }
@@ -59,6 +59,7 @@ $refs = @(
     (Join-Path $LunarisLibDir "Lunaris.dll"), (Join-Path $LunarisLibDir "0Harmony.dll"),
     (Join-Path $managed "Assembly-CSharp.dll"), (Join-Path $managed "netstandard.dll"),
     (Join-Path $managed "UnityEngine.dll"), (Join-Path $managed "UnityEngine.CoreModule.dll"),
+    (Join-Path $managed "UnityEngine.UIModule.dll"), (Join-Path $managed "UnityEngine.TextRenderingModule.dll"),
     (Join-Path $managed "UnityEngine.UI.dll")
 )
 foreach ($ref in $refs) { if (-not (Test-Path $ref)) { throw "Missing reference: $ref" } }
@@ -67,6 +68,9 @@ $rsp = Join-Path $env:TEMP "ErenshorDuel.rsp"
 $lines = @('/nologo','/target:library','/optimize+',('/out:"{0}"' -f $out))
 $refs | ForEach-Object { $lines += ('/reference:"{0}"' -f $_) }
 Get-ChildItem (Join-Path $ScriptRoot "src") -Filter "*.cs" | ForEach-Object { $lines += '"' + $_.FullName + '"' }
+$fallbackUi = Join-Path (Split-Path -Parent (Split-Path -Parent $ScriptRoot)) "Erenshor-Mod-Suite\shared\ErenshorSuite.UI\StandaloneFallbackUi.cs"
+if (-not (Test-Path -LiteralPath $fallbackUi)) { throw "Missing shared standalone UI source: $fallbackUi" }
+$lines += '"' + $fallbackUi + '"'
 $lines | Set-Content $rsp -Encoding ASCII
 & $csc "@$rsp"
 if ($LASTEXITCODE -ne 0) { throw "Compilation failed." }

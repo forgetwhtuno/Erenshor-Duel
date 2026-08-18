@@ -1,5 +1,73 @@
 # Changelog
 
+## 0.4.6 - NPC self-cast misclassification and diagnostic truncation
+
+- Fixed the opposing duelist's offensive spells being resolved onto the caster. A live duel recorded
+  `Burning Chains` (StatusEffect, `TargetDamage=50`) cast by the Sim with the caster as the
+  `StartSpell` Stats argument, classified `self_contained_self_cast`, and applied to the caster
+  instead of the player. Root cause: the 0.4.2 repair inferred self-application from "target argument
+  equals caster", which is sound for the player (Hotkeys hands `StartSpell` the selected target) but
+  not for an NPC. Verified in the installed `Assembly-CSharp`, all three `NPC.DoAttackSpell` call
+  sites pass `CurrentAggroTarget.MyStats` (IL_0a22/IL_0bd7/IL_0d9f), while other native NPC cast
+  paths pass the caster's own Stats for spells that still resolve onto the opponent.
+- A spell that damages its target (`TargetDamage`, `BleedDamagePercent`, or `Lifetap`) can now only
+  become a self-cast when the spell asset declares it via `SelfOnly` / `ApplyToCaster` /
+  `InflictOnSelf`. Declared self-application still outranks the qualifier, so genuine self-damage
+  effects are unchanged, and non-damaging self-buffs/self-heals keep the existing behavior. The
+  0.4.5 targeted heal adaptation is untouched.
+- Fixed damage/healing telemetry being cut mid-field. `DiagnosticVirtual` routed through the 120-char
+  `SafeLabel` cap, so every live `native_damage` / `virtual_damage` / `virtual_heal` line ended at
+  `virtualAfte` and lost `virtualAfter`, `realBefore`, `realAfter`, `yieldThreshold`, `yield` and
+  `reason` - exactly the fields that distinguish a virtualized hit from a preserved world hit. These
+  records now use the record path, as do `world_damage`, `duel_start`, `duel_terminal`, `cleanup`,
+  `diag=summary` and both `third_party_heal_blocked` lines.
+- Raised the record ceiling from 400 to 900 characters. A live `spell_commit` measured 424 and lost
+  `startSpellEntered`, `nativeResult`, `manaBefore`/`manaAfter` and `resourceCommitted` - the fields
+  that say whether native `StartSpell` actually ran and what it returned.
+- Added deterministic coverage for the damaging-spell qualifier and tightened the self-cast source
+  guard to require it.
+
+
+## 0.4.5 - targeted ordinary self-heal admission
+
+- Preserves the live-proven 0.4.4 scoped `Stats.ReduceHP` damage transaction unchanged.
+- Fixes ordinary single-target `Heal` spells such as Minor Healing when the opposing duelist remains selected. During Active only, if the exact duelist caster receives the exact opposing duelist as the `StartSpell` Stats argument, and the spell is a contained healing-only single-target shape, the Harmony prefix rewrites only that method argument to the caster's own Stats. `PlayerControl.CurrentTarget` is never changed.
+- The adaptation is deliberately not a generic beneficial retarget: area/group, summon, charm, proc, mixed damage/heal, and unknown utility shapes remain under the existing containment rules.
+- Native `CastSpell.StartSpell` still owns mana, cooldown, cast time, animation, and heal amount; existing `HealMe` capture translates the native self-heal into virtual Duel HP exactly once.
+- Declared `SelfOnly` / `ApplyToCaster` / `InflictOnSelf`, AoE/world-combat, lifesteal, protected-NPC, COOP, and cleanup behavior are preserved.
+
+
+## 0.4.4 - scoped ReduceHP damage transaction restoration
+
+- Repairs the 0.4.3 instant-yield regression. The temporary synthetic HP-headroom transaction is removed from participant damage: Duel no longer assigns a massive temporary `CurrentHP` value and no longer derives virtual damage from a synthetic before/after HP delta.
+- Restores the live-proven 0.4.1 semantic boundary without rolling back newer work: native `DamageMe` / `MagicDamageMe` / `BleedDamageMe` still perform Erenshor mitigation/resistance/crit/class math; the exact in-flight participant `Stats.ReduceHP` call captures the final effective amount, returns `false` to suppress that one real/mirrored HP write, and `FinishNativeDamage` applies the captured amount to virtual HP exactly once.
+- Modernizes the old capture with the current 0.4.3 `NativeDamageState.Previous` transaction stack. Nested procs/retaliation can push/pop scoped states without overwriting an outer transaction, and `WorldReal` hostile-world damage explicitly bypasses Duel capture so native world HP/death remains authoritative.
+- Keeps the current source/target authority matrix: duel participant edges virtualize; duelist <-> verified hostile-world actors remain real native combat; protected/friendly/unknown unsafe edges remain contained. The actor/effect-aware AoE policy, protected-NPC preflight/per-target containment, and hostile-world coexistence are unchanged.
+- Preserves the opponent-selected self-cast repair (`SelfOnly || ApplyToCaster || InflictOnSelf`) and native mana/cooldown/cast ownership. Self-heal/HoT/lifesteal/resource effects remain native-adjacent and update virtual health through the existing bounded heal path.
+- Strengthens `/eduel diag` damage evidence with native entry, source/target role, raw amount, whether `ReduceHP` was captured, captured effective amount, virtual scale/delta/before/after, real-ledger before/after, virtualization flag, and whether world damage was preserved.
+- Reverses the 0.4.3 source-contract guard that required observation-only `ReduceHP`; deterministic/source guards now require scoped capture, nested-stack ownership, no synthetic headroom path, current self-cast admission, current AoE/world authority, and cleanup ownership.
+
+## 0.4.3 - combat semantics, hostile-world authority, and AoE containment
+
+- Fixes the 0.4.2-era zero-damage regression by removing duel ownership of `Stats.ReduceHP`: the Prefix now observes only. Admitted participant hits once again let native `DamageMe` / `MagicDamageMe` / `BleedDamageMe` run against temporary non-lethal HP headroom, measure the completed native HP delta, restore the duel mirror, and apply that effective amount exactly once to virtual HP.
+- Preserves the 0.4.2 self-cast admission repair. `SelfOnly`, `ApplyToCaster`, and `InflictOnSelf` remain authoritative declarations of caster application even when `StartSpell` receives the selected opponent's `Stats`. Native mana/cooldown/cast behavior is still owned by Erenshor.
+- Adds explicit source/target damage authority: exact duel participant edges are virtual; duelist -> verified hostile-world NPC and hostile-world NPC -> duelist are real native Erenshor combat; friendly/protected/unknown nonparticipant edges remain blocked. Ordinary hostile aggro no longer cancels a duel solely for existing.
+- Adds a separate real-world HP ledger while virtual HP is mirrored. Hostile-world damage is applied against the real ledger and survives duel cleanup; a real native death is never overwritten by duel restoration. Damage-shield retaliation receives the same treatment, including nested native-damage detection.
+- Tightens hostile classification. Vendors, villagers/friendly factions, Sims, player/group actors, summons/pets, mining nodes, treasure chests, `NeverAggro` NPCs, and unresolved actors cannot be promoted to hostile-world authority merely because an `NPC` component exists.
+- Adds AoE-aware StartSpell admission for `AE`, `PBAE`, and `GroupEffect` shapes. The bounded preflight uses current native `NearbyEnemies` / `NearbyFriends` candidate collections and exact actor roles; hostile-world candidates are explicitly allowed. The supplied source/refs expose no authoritative spell radius/shape-distance member, so the runtime records `radius=unavailable_in_supplied_api` rather than inventing one. Per-target damage/heal/status hooks remain the final containment boundary.
+- Beneficial AoE/self-resource effects stay native for the caster/participant while unrelated beneficiaries are suppressed per target. Unsafe summon/charm/proc area shapes remain blocked. Offensive effects reaching protected/unknown nonparticipants are refused and surface the existing-chat message `Can't use that here — someone else is in the blast.`
+- Hostile-world status effects are adopted slot-by-slot into the real cleanup baseline rather than snapshotting all current duel effects. Tracked world-owned effect durations can advance/expire without causing duel-only buffs/debuffs to persist after cleanup. Mixed unattributed periodic bleed sources fail safely instead of guessing whether a world tick is virtual.
+- Expands `/eduel diag` with the last damage authority decision, last AoE preflight, real-ledger values, and native StartSpell mana before/after. Cooldown commitment remains explicitly `unavailable_in_supplied_api` until the current installed assembly can be inspected live.
+
+## 0.4.2 - self-cast spell admission repair
+
+- Fixes legitimate self-heals, HoTs, self-buffs and other caster-applied spells being silently refused during an Active duel whenever the opponent was selected: the cast did not begin, consumed no mana, and started no cooldown.
+- Root cause: duel spell admission decided "self-cast vs cast at the opponent" from the `Stats` argument handed to `CastSpell.StartSpell`, and only consulted the spell's own `SelfOnly`/`ApplyToCaster`/`InflictOnSelf` flags when that argument was null. Installed `Assembly-CSharp` `Hotkeys::DoHotkeyTask` (self branch, IL_00C5) assigns `PlayerControl.CurrentTarget` into that argument for a `SelfOnly` spell whenever anything is targeted, and only substitutes the caster when nothing is targeted; the real self-redirection happens afterwards inside `CastSpell::StartSpell`, which reads `Spell.SelfOnly` itself. A self-cast made with the opponent selected was therefore misread as a beneficial spell aimed at the opponent, which fails the offense test (`TargetHealing > 0`, or the `Beneficial`/`Heal` spell types), so the Harmony prefix returned false and native `StartSpell` never ran.
+- Repair: self-application is now recognised from the spell asset itself, independent of the caller-supplied target. The fix only stops the incorrect block - it does not synthesise mana, cooldown, healing, or animation; native `StartSpell` performs the cast, resource cost, cooldown and self-redirection exactly as vanilla does.
+- Containment is unchanged: an admitted self-cast must still pass the self-contained test, so group effects, pet summons and charms remain blocked, offensive casts still route through duel virtualisation, and third-party/outside-hostile handling is untouched.
+- Adds `DuelSpellAdmissionPolicy`, a pure no-Unity policy that owns the self-application/self-cast/containment decisions so the shipped logic is the logic the offline deterministic suite exercises, including an explicit assertion that the pre-repair calculation would have missed the regression.
+- Adds bounded per-decision spell-admission telemetry (spell name, native type, caster/target roles, the three self flags, computed self-cast, `TargetHealing`/`TargetDamage`, group/pet/charm shape, admission, reject stage, and whether native `StartSpell` was allowed to run), surfaced through `/eduel diag`. One line per admission decision, no per-frame logging, no private state.
+
 ## 0.4.1 - RC terminal cleanup proof
 
 - Restores party Guard/follow movement ownership from both normal and emergency terminal paths before participant references are cleared.
@@ -25,7 +93,7 @@
 
 ## Unreleased - Suite Hub control-surface refinement
 
-- Kept Practice Duel combat/virtual-health containment unchanged; no new standalone panel or launcher was added.
+- Kept Practice Duel combat/virtual-health containment unchanged; documented the existing shared Hub-aware retained fallback entry point rather than adding another gameplay UI surface.
 - Bounded Hub-facing status to a concise active/idle line plus eligible-local-candidate count while preserving the authoritative `challenge(name)` and `stop` ControlApi/Aura actions.
 - The current Hub renderer does not render arbitrary argument-entry actions, so `challenge(name)` remains transport/API-ready rather than inventing a fake selector or modifying Hub in this workstream.
 
