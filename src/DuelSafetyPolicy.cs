@@ -26,7 +26,9 @@ namespace ErenshorDuel
             bool sourceFriendly, bool sourceOutsideHostile, bool sourceUnknown)
         {
             if (!targetIsDuelist) return DuelOutsideEffectDisposition.Allow;
-            if (sourceOutsideHostile) return DuelOutsideEffectDisposition.Cancel;
+            // Hostile world combat is intentionally allowed to overlap Practice Duel. Friendly or
+            // unresolved third-party effects remain contained so they cannot assist/interfere.
+            if (sourceOutsideHostile) return DuelOutsideEffectDisposition.Allow;
             if (sourceFriendly || sourceUnknown) return DuelOutsideEffectDisposition.Block;
             return DuelOutsideEffectDisposition.Allow;
         }
@@ -80,15 +82,15 @@ namespace ErenshorDuel
             return existedAtStart && !existsNow;
         }
 
-        // A direct damage/aggro relation against a duelist is stronger evidence than actor-type
-        // classification. Unknown sources are therefore cancellation-worthy on direct hostile
-        // ingress, while known friendly party sources remain blocked without dogpiling.
+        // Exact hostile-world actors are allowed to overlap the duel and stay native. Friendly or
+        // unresolved direct ingress remains blocked; unknown does not get promoted to a hostile
+        // world actor merely because it reached a duelist.
         internal static DuelOutsideEffectDisposition DirectHostileIngress(bool targetIsDuelist,
             bool sourceFriendly, bool sourceOutsideHostile, bool sourceUnknown)
         {
             if (!targetIsDuelist) return DuelOutsideEffectDisposition.Allow;
-            if (sourceFriendly) return DuelOutsideEffectDisposition.Block;
-            if (sourceOutsideHostile || sourceUnknown) return DuelOutsideEffectDisposition.Cancel;
+            if (sourceOutsideHostile) return DuelOutsideEffectDisposition.Allow;
+            if (sourceFriendly || sourceUnknown) return DuelOutsideEffectDisposition.Block;
             return DuelOutsideEffectDisposition.Allow;
         }
 
@@ -126,8 +128,8 @@ namespace ErenshorDuel
             if (AllowGroupAssistCall(true, true) || !AllowGroupAssistCall(true, false))
                 return "FAIL safety: group assist suppression";
 
-            if (OutsideEffect(true, false, true, false) != DuelOutsideEffectDisposition.Cancel)
-                return "FAIL safety: outside hostile effect must cancel";
+            if (OutsideEffect(true, false, true, false) != DuelOutsideEffectDisposition.Allow)
+                return "FAIL safety: outside hostile effect must remain native";
             if (OutsideEffect(true, false, false, true) != DuelOutsideEffectDisposition.Block)
                 return "FAIL safety: unsupported unknown effect must block";
             if (OutsideEffect(false, false, true, false) != DuelOutsideEffectDisposition.Allow)
@@ -156,11 +158,11 @@ namespace ErenshorDuel
                 ShouldRestoreInitialEnemyMembership(false, true) ||
                 ShouldRestoreInitialEnemyMembership(false, false))
                 return "FAIL safety: nearby-enemy cleanup must be additive only";
-            if (DirectHostileIngress(true, false, false, true) != DuelOutsideEffectDisposition.Cancel ||
-                DirectHostileIngress(true, false, true, false) != DuelOutsideEffectDisposition.Cancel ||
+            if (DirectHostileIngress(true, false, false, true) != DuelOutsideEffectDisposition.Block ||
+                DirectHostileIngress(true, false, true, false) != DuelOutsideEffectDisposition.Allow ||
                 DirectHostileIngress(true, true, false, false) != DuelOutsideEffectDisposition.Block ||
                 DirectHostileIngress(false, false, true, false) != DuelOutsideEffectDisposition.Allow)
-                return "FAIL safety: direct hostile ingress";
+                return "FAIL safety: direct hostile ingress/world overlap";
             if (!ShouldEmitTerminalEvent(true) || ShouldEmitTerminalEvent(false))
                 return "FAIL safety: terminal event idempotence";
 
@@ -168,6 +170,9 @@ namespace ErenshorDuel
                 return "FAIL safety: terminal cleanup must not restore duel target";
             if (ApplyVirtualDamageOnce(745, 506) != 239 || ApplyVirtualDamageOnce(239, 506) != 1)
                 return "FAIL safety: virtual damage must be applied once per event";
+            int healthyAfterSmallHit = ApplyVirtualDamageOnce(1000, 12);
+            if (healthyAfterSmallHit != 988 || ReachedYieldThreshold(healthyAfterSmallHit, 1000, 5))
+                return "FAIL safety: one small hit must not instant-yield a healthy duelist";
             if (ReachedYieldThreshold(239, 3146, 5) || !ReachedYieldThreshold(157, 3146, 5))
                 return "FAIL safety: virtual yield threshold";
             if (ThirdPartyHealChangesVirtualHealth())

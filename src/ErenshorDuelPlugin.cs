@@ -13,9 +13,11 @@ namespace ErenshorDuel
     public sealed class ErenshorDuelPlugin : LunarisPlugin
     {
         internal const string PluginGuid = "forgetwhtuno.erenshor.practice-duels";
-        internal const string PluginVersion = "0.4.1";
+        internal const string PluginVersion = "0.4.4";
         internal static ErenshorDuelPlugin Instance;
         private Harmony _harmony;
+        private bool _runtimeHooksReady;
+        private string _runtimeHookFailure = string.Empty;
         private static bool _sceneHooksInstalled;
         private string _pendingControlChallenge;
         private bool _pendingControlStop;
@@ -25,10 +27,22 @@ namespace ErenshorDuel
         {
             Instance = this;
             _harmony = new Harmony(PluginGuid);
-            _harmony.PatchAll();
+            try
+            {
+                _harmony.PatchAll();
+                _runtimeHooksReady = true;
+                _runtimeHookFailure = string.Empty;
+            }
+            catch (Exception ex)
+            {
+                _runtimeHooksReady = false;
+                _runtimeHookFailure = ex.GetType().Name;
+                try { _harmony.UnpatchSelf(); } catch { }
+                Logging.LogError("Practice Duels runtime hooks unavailable (" + _runtimeHookFailure + "). Duel gameplay is disabled, but the standalone status UI will remain available.");
+            }
             DeepSimsCompatibility.Initialize();
             CoopCompatibility.Refresh();
-            if (!_sceneHooksInstalled)
+            if (_runtimeHooksReady && !_sceneHooksInstalled)
             {
                 SceneManager.sceneLoaded += OnSceneLoaded;
                 SceneManager.sceneUnloaded += OnSceneUnloaded;
@@ -79,6 +93,12 @@ namespace ErenshorDuel
         private void Update()
         {
             StandaloneFallbackUi.Tick(DuelUiReady());
+            if (!_runtimeHooksReady)
+            {
+                _pendingControlChallenge = null;
+                _pendingControlStop = false;
+                return;
+            }
             try
             {
                 if (_pendingControlStop) { _pendingControlStop = false; DuelController.Stop("Practice duel stopped from Suite Hub."); }
@@ -129,12 +149,19 @@ namespace ErenshorDuel
             catch { try { UpdateSocialLog.LogAdd(message); } catch { } }
         }
 
+        internal bool RuntimeHooksReady { get { return _runtimeHooksReady; } }
+        internal string RuntimeHookFailure { get { return _runtimeHookFailure; } }
+
         internal bool RequestControlChallenge(string simName)
         {
-            if (string.IsNullOrWhiteSpace(simName) || !DuelController.CanStartNewDuel) return false;
+            if (!_runtimeHooksReady || string.IsNullOrWhiteSpace(simName) || !DuelController.CanStartNewDuel) return false;
             _pendingControlChallenge = simName.Trim(); _pendingControlStop = false; return true;
         }
-        internal bool RequestControlStop() { _pendingControlStop = true; _pendingControlChallenge = null; return true; }
+        internal bool RequestControlStop()
+        {
+            if (!_runtimeHooksReady) return !DuelController.Active;
+            _pendingControlStop = true; _pendingControlChallenge = null; return true;
+        }
 
         internal void Diagnostic(string message)
         {
