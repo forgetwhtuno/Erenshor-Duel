@@ -1,5 +1,6 @@
 using System;
 using Lunaris;
+using Lunaris.Config;
 using HarmonyLib;
 using UnityEngine;
 using UnityEngine.SceneManagement;
@@ -13,9 +14,11 @@ namespace ErenshorDuel
     public sealed class ErenshorDuelPlugin : LunarisPlugin
     {
         internal const string PluginGuid = "forgetwhtuno.erenshor.practice-duels";
-        internal const string PluginVersion = "0.4.6";
+        internal const string PluginVersion = "0.4.17";
         internal static ErenshorDuelPlugin Instance;
         private Harmony _harmony;
+        private DuelSettings _settings;
+        internal static bool VerboseDiagnostics { get; private set; }
         private bool _runtimeHooksReady;
         private string _runtimeHookFailure = string.Empty;
         private static bool _sceneHooksInstalled;
@@ -23,9 +26,21 @@ namespace ErenshorDuel
         private bool _pendingControlStop;
         private DuelSuiteAuraProvider _auraProvider;
 
+        // Launcher/control-surface readiness must match the rest of the Forgotten Roads suite.
+        // Merely having PlayerControl/Myself is too early: those persistent objects can exist while
+        // the destination scene and Sim systems are still initializing during character entry.
+        private const float UiStableReadySeconds = 1.0f;
+        private static float _uiRawReadySince = -1f;
+        private static int _uiReadySceneHandle = int.MinValue;
+        private static bool _uiCanMoveLatched;
+        private static bool _uiReadyAcquired;
+
         private void Awake()
         {
             Instance = this;
+            _settings = new DuelSettings();
+            Config.Register(ref _settings);
+            VerboseDiagnostics = _settings.DiagnosticsVerbose;
             _harmony = new Harmony(PluginGuid);
             try
             {
@@ -60,16 +75,28 @@ namespace ErenshorDuel
 
             Logging.LogInfo("Practice Duels " + PluginVersion + " loaded. Use /eduel <SimName>, /eduel <Sim A> vs <Sim B>, /eduel nearby, /eduel status, /eduel diag, /eduel selftest, or /eduel stop.");
             StandaloneFallbackUi.Initialize(this, "duel", "PRACTICE DUEL",
-                "Select a Sim for the full Sim Actions surface, or challenge the first eligible nearby Sim here.", 160f,
+                "Select a Sim for the full Sim Actions surface, or challenge the first eligible nearby Sim here.\n" +
+                "Sim vs Sim: /eduel <Sim A> vs <Sim B>",
+                StandaloneLauncherColumnPolicy.DefaultX(),
+                StandaloneLauncherColumnPolicy.DefaultY(StandaloneLauncherColumnPolicy.SlotIndex),
                 DuelControlApi.GetStatus,
                 new FallbackAction("Challenge Nearby", ChallengeFirstEligible, delegate { return DuelControlApi.GetBasicState().CanStart && (DuelControlApi.GetBasicState().EligibleNames ?? new string[0]).Length > 0; }),
                 new FallbackAction("Stop Duel", DuelControlApi.TryStop, delegate { return DuelControlApi.GetBasicState().Active; }));
+            // Compact workspace tuning: the guide text alone is two lines, and status can grow to
+            // list eligible Sim names, so this keeps more headroom than Follow's. Default panel
+            // position sits in the shared right-side workspace below the launcher column - above
+            // the combat/chat log, not overlapping it - instead of the old lower-center default.
+            StandaloneFallbackUi.ConfigureWorkspaceDefaults(68f,
+                StandaloneLauncherColumnPolicy.DefaultPanelRightNormalized(),
+                StandaloneLauncherColumnPolicy.DefaultPanelTopNormalized(),
+                StandaloneLauncherColumnPolicy.SlotIndex);
         }
         private static bool ChallengeFirstEligible()
         { string[] names = DuelControlApi.GetBasicState().EligibleNames ?? new string[0]; return names.Length > 0 && DuelControlApi.TryChallenge(names[0]); }
 
         private void OnSceneLoaded(Scene scene, LoadSceneMode mode)
         {
+            ResetDuelUiReadiness();
             // A queued Hub challenge is actor-name based and must never survive a zone boundary.
             _pendingControlChallenge = null;
             DuelController.HandleSceneTransition();
@@ -79,6 +106,7 @@ namespace ErenshorDuel
 
         private void OnSceneUnloaded(Scene scene)
         {
+            ResetDuelUiReadiness();
             _pendingControlChallenge = null;
             DuelController.HandleSceneTransition();
         }
@@ -99,6 +127,7 @@ namespace ErenshorDuel
                 _pendingControlStop = false;
                 return;
             }
+            try { DuelSimActionsFallback.Tick(); } catch { }
             try
             {
                 if (_pendingControlStop) { _pendingControlStop = false; DuelController.Stop("Practice duel stopped from Suite Hub."); }
@@ -106,7 +135,7 @@ namespace ErenshorDuel
                 {
                     string requested = _pendingControlChallenge; _pendingControlChallenge = null;
                     bool ambiguous; SimPlayer sim = DuelController.FindSim(requested, out ambiguous);
-                    if (!ambiguous && sim != null && DuelController.CanStartNewDuel) DuelController.Start(sim);
+                    if (!ambiguous && sim != null && DuelController.CanStartNewDuel) DuelController.Start(sim, DuelRequestOrigin.ExplicitPlayer);
                 }
                 DuelController.Tick();
             }
@@ -121,6 +150,7 @@ namespace ErenshorDuel
         private void OnDestroy()
         {
             StandaloneFallbackUi.Dispose();
+            try { DuelSimActionsFallback.Shutdown(); } catch { }
             _pendingControlChallenge = null; _pendingControlStop = false;
             DuelController.Shutdown();
             try { if (_harmony != null) _harmony.UnpatchSelf(); } catch { }
@@ -134,13 +164,80 @@ namespace ErenshorDuel
             _auraProvider = null;
             DeepSimsCompatibility.Reset();
             CoopCompatibility.Reset();
+            DuelFollowCompatibility.Reset();
+            ResetDuelUiReadiness();
+            VerboseDiagnostics = false;
+            _settings = null;
             if (Instance == this) Instance = null;
         }
 
-        private static bool DuelUiReady()
+        // internal (not private): DuelSimActionsFallback shares the exact same stable-world gate as
+        // the standalone launcher. PlayerControl/Myself alone is not sufficient during character
+        // entry because those persistent objects can exist before the active zone/Sim systems are
+        // actually usable. Match the suite's canonical readiness acquisition semantics: prove the
+        // world graph, observe CanMove at least once, then remain stable for one second.
+        internal static bool DuelUiReady()
         {
-            try { return !GameData.InCharSelect && !GameData.Zoning && GameData.PlayerControl != null && GameData.PlayerControl.Myself != null; }
+            if (!RawDuelUiReady())
+            {
+                ResetDuelUiReadiness();
+                return false;
+            }
+
+            Scene scene = SceneManager.GetActiveScene();
+            if (_uiReadySceneHandle != scene.handle)
+            {
+                _uiReadySceneHandle = scene.handle;
+                _uiRawReadySince = Time.unscaledTime;
+                _uiCanMoveLatched = false;
+                _uiReadyAcquired = false;
+            }
+            if (_uiRawReadySince < 0f) _uiRawReadySince = Time.unscaledTime;
+
+            if (_uiReadyAcquired) return true;
+
+            try
+            {
+                if (GameData.PlayerControl != null && GameData.PlayerControl.CanMove)
+                    _uiCanMoveLatched = true;
+            }
+            catch { }
+
+            if (!_uiCanMoveLatched || Time.unscaledTime - _uiRawReadySince < UiStableReadySeconds)
+                return false;
+
+            _uiReadyAcquired = true;
+            return true;
+        }
+
+        private static bool RawDuelUiReady()
+        {
+            try
+            {
+                if (GameData.InCharSelect || GameData.Zoning) return false;
+                if (GameData.PlayerControl == null || GameData.PlayerControl.Myself == null) return false;
+
+                Character player = GameData.PlayerControl.Myself;
+                if (player.MyStats == null || player.gameObject == null || !player.gameObject.activeInHierarchy)
+                    return false;
+
+                Scene scene = SceneManager.GetActiveScene();
+                if (!scene.IsValid() || !scene.isLoaded) return false;
+
+                if (GameData.SimMngr == null || GameData.SimPlayerGrouping == null || GameData.GroupMembers == null)
+                    return false;
+
+                return true;
+            }
             catch { return false; }
+        }
+
+        private static void ResetDuelUiReadiness()
+        {
+            _uiRawReadySince = -1f;
+            _uiReadySceneHandle = int.MinValue;
+            _uiCanMoveLatched = false;
+            _uiReadyAcquired = false;
         }
 
         internal void Chat(string message, string color)
@@ -165,8 +262,16 @@ namespace ErenshorDuel
 
         internal void Diagnostic(string message)
         {
-            // Duel lifecycle diagnostics are expected observability, not warning conditions.
-            // Exceptions and actual patch failures continue to use error logging at their call sites.
+            // Forensic duel diagnostics can fire once per hit/spell/effect. Keep that developer
+            // observability available, but do not synchronously format/write it during normal play.
+            if (!VerboseDiagnostics) return;
+            Logging.LogDebug(message);
+        }
+
+        internal void LifecycleDiagnostic(string message)
+        {
+            // Low-frequency state transitions remain visible even with verbose diagnostics off, so a
+            // live report can still prove Preparing/Countdown/Active/Cleaning/Idle and terminal cleanup.
             Logging.LogDebug(message);
         }
 
@@ -242,7 +347,7 @@ namespace ErenshorDuel
                         : "[Practice Duel] Both Sims must be living, local, in this scene, and within 25m of you.", "yellow");
                     return true;
                 }
-                DuelController.StartSpectator(first, second);
+                DuelController.StartSpectator(first, second, DuelRequestOrigin.ExplicitPlayer);
                 return true;
             }
 
@@ -255,7 +360,7 @@ namespace ErenshorDuel
                     : "[Practice Duel] No living same-scene local SimPlayer matched within 25m. Use /eduel nearby or /eduel diag for status.", "yellow");
                 return true;
             }
-            DuelController.Start(sim);
+            DuelController.Start(sim, DuelRequestOrigin.ExplicitPlayer);
             return true;
         }
     }

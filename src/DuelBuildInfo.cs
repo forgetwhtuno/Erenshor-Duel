@@ -4,6 +4,6 @@ namespace ErenshorDuel
     // development build even before a commit exists.
     internal static class DuelBuildInfo
     {
-        internal const string Id = "0.4.6-rc-npc-selfcast-repair";
+        internal const string Id = "0.4.17-rc-stable-world-launcher-readiness";
     }
 }

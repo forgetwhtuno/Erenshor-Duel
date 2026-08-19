@@ -72,6 +72,47 @@ namespace ErenshorDuel
             }
         }
 
+        // Single source of the human-readable rejection text. DuelController.ReportEligibilityFailure
+        // (chat) and the standalone Sim Actions fallback UI (inline label) both call this instead of
+        // each carrying their own copy of the wording, so the two surfaces can never drift apart.
+        internal static string DescribeForUi(DuelEligibilityDecision decision)
+        {
+            switch (decision)
+            {
+                case DuelEligibilityDecision.Eligible: return string.Empty;
+                case DuelEligibilityDecision.RemoteCoop: return "Remote COOP humans/proxies cannot be challenged.";
+                case DuelEligibilityDecision.MissingCombatComponents: return "That Sim is missing required local combat components.";
+                case DuelEligibilityDecision.CampConflict: return "End Hunt Camp before starting a duel. Relax does not block friendly duels.";
+                case DuelEligibilityDecision.TooFar: return "Move closer before challenging that Sim.";
+                case DuelEligibilityDecision.UnsafeRealCombat: return "That challenge is unsafe while real combat is active.";
+                case DuelEligibilityDecision.Dead: return "That Sim is not alive.";
+                case DuelEligibilityDecision.WrongScene: return "That Sim is not in your current zone.";
+                case DuelEligibilityDecision.Inactive: return "That Sim is no longer present.";
+                case DuelEligibilityDecision.NotSimPlayer: return "Choose a living local SimPlayer in the current scene.";
+                default: return "Choose a living local SimPlayer in the current scene.";
+            }
+        }
+
+        // A hard-invalid decision means the actor reference itself is no longer usable at all (gone,
+        // never loaded, or not the right kind of object) -- there is nothing to wait out. Every other
+        // rejection (too far, camp conflict, unsafe combat, remote authority) is situational: the same
+        // Sim reference stays meaningful and may become eligible again without picking a new target.
+        // The standalone fallback UI uses this distinction to decide "cancel the arrangement and
+        // explain why" versus "keep showing the same Sim with a disabled action and a live reason."
+        internal static bool IsHardInvalid(DuelEligibilityDecision decision)
+        {
+            switch (decision)
+            {
+                case DuelEligibilityDecision.NotSimPlayer:
+                case DuelEligibilityDecision.Inactive:
+                case DuelEligibilityDecision.Dead:
+                case DuelEligibilityDecision.WrongScene:
+                    return true;
+                default:
+                    return false;
+            }
+        }
+
         internal static string RunSelfTests()
         {
             DuelEligibilityInput good = new DuelEligibilityInput
@@ -134,6 +175,21 @@ namespace ErenshorDuel
             missing.HasCombatComponents = false;
             if (Evaluate(missing) != DuelEligibilityDecision.MissingCombatComponents)
                 return "FAIL eligibility: required combat components";
+
+            if (IsHardInvalid(DuelEligibilityDecision.NotSimPlayer) != true ||
+                IsHardInvalid(DuelEligibilityDecision.Inactive) != true ||
+                IsHardInvalid(DuelEligibilityDecision.Dead) != true ||
+                IsHardInvalid(DuelEligibilityDecision.WrongScene) != true)
+                return "FAIL eligibility: gone/never-valid decisions must be hard-invalid";
+            if (IsHardInvalid(DuelEligibilityDecision.RemoteCoop) || IsHardInvalid(DuelEligibilityDecision.TooFar) ||
+                IsHardInvalid(DuelEligibilityDecision.CampConflict) || IsHardInvalid(DuelEligibilityDecision.UnsafeRealCombat) ||
+                IsHardInvalid(DuelEligibilityDecision.MissingCombatComponents) || IsHardInvalid(DuelEligibilityDecision.Eligible))
+                return "FAIL eligibility: situational/recoverable decisions must not be hard-invalid";
+
+            if (string.IsNullOrEmpty(DescribeForUi(DuelEligibilityDecision.TooFar)) ||
+                string.IsNullOrEmpty(DescribeForUi(DuelEligibilityDecision.RemoteCoop)) ||
+                DescribeForUi(DuelEligibilityDecision.Eligible) != string.Empty)
+                return "FAIL eligibility: DescribeForUi must give a concrete reason for every rejection and nothing for Eligible";
 
             return "PASS eligibility";
         }

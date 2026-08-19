@@ -1,5 +1,306 @@
 # Changelog
 
+## 0.4.17 - stable-world release candidate
+
+- Reconciles the approved 0.4.16 combat/lifecycle/rematch behavior, normal-mode
+  forensic logging gate, stable-world launcher readiness, and shared collapsed
+  fallback UI integration under one release identity.
+- Combat semantics remain frozen: virtual HP, native damage capture, spells,
+  cleanup, rematch rules, and world-combat authority are unchanged in this
+  bookkeeping pass.
+
+## 0.4.16 - diagnostic performance gate
+
+- Freezes the live-good 0.4.15 duel lifecycle/combat behavior and moves forensic combat telemetry behind a new Lunaris `Diagnostics/Verbose` setting that defaults OFF. The supplied live session contained 204 Practice Duel debug lines out of 272 total log lines, including per-hit damage/heal, spell admission/commit, AoE, assist, and attribution records; synchronous debug I/O is therefore a plausible stutter contributor even though the log alone cannot prove frame-time causation.
+- Major lifecycle observability remains always-on at low frequency: state transitions, concise duel start/terminal records, and cleanup-gate snapshots still appear so live QA can prove `Preparing -> Countdown -> Active -> Cleaning -> Idle` without enabling per-hit logging. Errors/warnings are unchanged.
+- `DiagnosticVirtual`, throttled interference diagnostics, and `DiagnosticRecord` now fail fast before their own formatting/dictionary/logger work when verbose mode is off. Existing `/eduel diag` player-facing diagnostics and all gameplay policies remain unchanged.
+
+## 0.4.15 - recent-duel admission repair (explicit vs autonomous)
+
+Admission policy only. Frozen and untouched: `DuelArmingPolicy`, countdown behaviour, the
+`Stats.ReduceHP` transaction, virtual HP, combat math, native abilities, combat-text attribution,
+the `NPC.Combat` Cleaning re-entrancy repair, world combat policy, and the launcher/UI workspace.
+
+**Fixed: a deliberate re-challenge was refused for ~2 minutes after a duel.**
+- Live: the lifecycle repair works (`Active -> Cleaning`, `Cleaning -> Idle`,
+  `admissionBlocked=False`, `reason=cleanup_complete`), but a second explicit challenge of the same
+  Sim was then rejected with `decision=decline_recent_duel`, repeatedly, for Cyndara and Phanty.
+- Root cause: `RecentDuelCooldownSeconds = 120f` is a **social** cooldown whose purpose is to stop
+  AI-driven challenge spam, but it was applied to every request regardless of who asked.
+  `DuelChallengePolicy.Evaluate` checks `RecentDuel` as its first hard gate, and
+  `EvaluateWillingness` filled that flag from a single 120s window. The real inter-duel safety
+  window is the Cleaning interval, which the lifecycle state machine already enforces separately.
+- Repair: request origin is now explicit. `DuelRequestOrigin.ExplicitPlayer` (a deliberate
+  `/eduel <Sim>`, `/eduel <A> vs <B>`, Sim Actions **Practice Duel**/**Arrange Sim Duel**, or
+  Challenge Nearby) clears only a 1-second technical debounce; `DuelRequestOrigin.Autonomous`
+  (reserved for future Nemesis/ambient/rematch-offer integration) keeps the full 120s social
+  cooldown unchanged. One shared ledger, two windows, selected by the pure and unit-tested
+  `DuelChallengePolicy.RecentDuelWindowSeconds`.
+- `Start()` and `StartSpectator()` now **require** an origin argument with no default, so a future
+  autonomous caller cannot silently inherit explicit-player treatment by omitting it.
+- Nothing else was relaxed. Mechanical eligibility, remote-COOP exclusion, protected actors, unsafe
+  combat state, same-Sim rejection, low health, the lifecycle/Cleaning gate, and every other
+  existing safety failure reject exactly as before, identically for both origins.
+- `/eduel nearby` and the eligible-name listings now evaluate as an explicit request, so they no
+  longer advertise a `decline_recent_duel` the player would not actually receive.
+
+Note: in practice the 1s debounce is effectively inert, because a duel cannot complete faster than
+its own acceptance delay plus countdown (~4s) and the ledger timestamp is written at acceptance. It
+is retained as a cheap, explicit double-input guard rather than as a gate.
+
+## 0.4.14 - UI workspace normalization
+
+UI/layout only. Combat transaction, lifecycle, the 60-second timer, combat-text attribution, and
+the Cleaning gate (0.4.4-0.4.13) are all unchanged and frozen.
+
+- The standalone PRACTICE DUEL fallback panel's status box is now 68px instead of a fixed 88px
+  shared by every module regardless of content. Duel's guide text alone is two lines and status can
+  grow to list eligible Sim names, so it keeps more headroom than Follow's 56px. Opt-in via the new
+  `StandaloneFallbackUi.ConfigureWorkspaceDefaults(...)`, so unrelated fallback-panel users
+  (Campmaster, Deep Sims, Nemesis) are byte-for-behavior unchanged.
+- New default panel position: opens into a shared right-side workspace below the launcher column,
+  above the combat/chat log - not overlapping it - instead of the previous default that could sit
+  lower-center/right over important native UI. An existing saved position is preserved exactly.
+- Duel's launcher column slot changed from 2 to 1 (order is now Journal=0, Duel=1, Follow=2).
+- Fixed the shared launcher-column right margin, which previously resolved flush to the screen edge
+  with zero margin at any realistic resolution (see Journal 0.1.11 for the root cause).
+- The standalone launcher now shows a small structural open/active indicator (a top-edge accent bar
+  shared with Journal/Follow) instead of relying on panel visibility alone.
+
+## 0.4.13 - duel arming / Cleaning-NRE repair
+
+Lifecycle only. The combat transaction is unchanged and frozen: `Stats.ReduceHP` capture, virtual
+HP, damage values, mitigation, native spell use, procs, lifesteal/healing, AoE containment,
+spectator combat, yield thresholds, the 60-second timer, combat-text attribution, the repeated-duel
+Cleaning timer, Sim Actions, and the launcher are all untouched.
+
+**Fixed: participants attacked before the countdown finished.**
+- Root cause: the 0.4.11 combat-text attribution repair pinned `NPC.CurrentAggroTarget` onto the
+  duel opponent from `NPC.Combat`/`NPC.CheckAssist`, but gated that repin on the session-wide
+  `Active` property, which is true for `Preparing` **and** `Countdown` as well as `Active`. So the
+  pair was pinned onto each other the moment the challenge was accepted, and native AI began
+  attacking during the 3/2/1 countdown. The live log showed exactly this:
+  `combat_text_attribution ... stage=NPC.CheckAssist sourceRole=DuelParticipant` between
+  `Idle -> Preparing` and `Preparing -> Countdown`.
+- Second gap: `NPC.Combat` calls `PerformMeleeHit` directly (verified in the installed
+  `Assembly-CSharp.dll` at `IL_0314` and `IL_048F`). `AllowCombatAction` only covered
+  `DoAttackSpell`/`DoAttackSkill`, so plain melee had no pre-GO gate at all.
+- Repair: a new pure `DuelArmingPolicy` defines "armed" as `Active` only. The attribution repin now
+  *disarms* the participant<->participant edge before GO instead of pinning it, and a narrow
+  admission gate in front of `NPC.Combat` refuses that one edge while unarmed. Nothing else is
+  touched: a non-participant NPC, a bystander Sim, and a participant genuinely fighting a hostile
+  world actor all run completely vanilla. No arena bubble, nothing globally frozen, no timescale
+  change.
+- Real health was already safe before GO and stays that way: pre-`Active` duel-pair damage returns
+  zero and skips native `DamageMe`/`MagicDamageMe`/`BleedDamageMe`/`SelfDamageMe`/
+  `SelfDamageMeFlat`/`DamageShieldTaken` entirely, offensive spells are refused with
+  `lifecycle_not_active`, and status/heal ingress is blocked. Because native damage never runs,
+  `Stats.ReduceHP` is never reached and no native death path can be entered through the duel pair.
+
+**Fixed: `NullReferenceException` in `NPC.Combat` during Cleaning after a spectator duel.**
+- Root cause (verified against the installed assembly): `NPC.Combat` executes
+  `IL_0314 call PerformMeleeHit` then, with **no null guard at all**,
+  `IL_031A ldfld CurrentAggroTarget` / `IL_0324 stfld Character::RecentDirectHit`. When a duel
+  reaches its yield threshold inside that melee hit, `ApplyVirtualDamage` calls `Stop()`
+  synchronously from the damage prefix, and terminal cleanup nulled `CurrentAggroTarget` while that
+  native frame was still on the stack - so the store at `IL_0324` dereferenced null. Spectator duels
+  hit this far more often because both participants drive `Combat()` themselves and so are much more
+  likely to deliver the finishing blow from inside that frame.
+- Repair: the native `Combat` frame is now scoped (prefix marks entry, a `[HarmonyFinalizer]`
+  releases it even if native code throws, and the exception is returned unchanged - never
+  swallowed). Every duel-owned `CurrentAggroTarget` write during teardown goes through one
+  re-entrancy-safe writer that defers the write until the frame has returned, then applies the real
+  disarm. No `NullReferenceException` is caught, no dummy target is fabricated, and `NPC.Combat` is
+  never suppressed globally. Post-duel target restoration is unchanged and still proof-based: only a
+  target that is alive with live `Stats` is ever restored, otherwise the NPC is left in a native
+  non-combat state for `DoNonRaidBehavior` to reacquire normally.
+
+**Diagnostics**
+- New bounded, throttled `preactive_duel_combat` record (`state`, `sourceRole`, `targetRole`,
+  `entry`, `currentAggroTarget`, `playerCurrentTarget`, `action`) identifying the exact native entry
+  point of any pre-GO duel-pair attempt.
+- The Cleaning-time participant record now also reports `npcMyStatsExists`, `actorMyStatsExists`,
+  `npcThisSimLinkageValid`, `insideNativeCombat`, `deferredDisarmPending`, and
+  `safeRestoreEligible` - exactly the preconditions native `NPC.Combat` dereferences unguarded.
+- The `duel_start` build label was stale (`0.4.11-rc-...` while the plugin reported 0.4.12); it now
+  tracks the current source.
+
+## 0.4.12 - shared standalone-launcher visual/placement pass
+
+- The standalone PRACTICE DUEL launcher (`Erenshor-Mod-Suite/shared/ErenshorSuite.UI/StandaloneFallbackUi.cs`,
+  used whenever Suite Hub is absent/unhealthy) now matches Journal's canonical launcher chrome exactly:
+  154x32 launcher, 20px grip, 1px outline frame, and a centered three-dot grip accent - previously a
+  plain colored rect with a slightly different ad-hoc dot layout.
+- New default standalone position: a vertical right-side column beneath the native minimap area
+  (Journal/Follow/Duel occupy fixed, non-overlapping slots), replacing the old lower-left default. No
+  stable minimap RectTransform exists in the installed assembly to derive an exact lower edge from, so
+  the column uses a resolution-independent top-right anchor with a conservative fixed inset.
+- Fixed a pre-existing defect: dragging the launcher never actually persisted its position (the shared
+  save path only recognized the larger fallback panel). The launcher now saves/restores its own
+  position the same way the panel already does, so an existing install with no real saved launcher
+  position adopts the new right-side default automatically; any future saved position is preserved.
+- Added `src/StandaloneLauncherColumnPolicy.cs`, a small per-module copied policy (same convention as
+  `StandaloneLauncherVisual.cs`) giving Duel its column slot (2 of 3, after Journal and Follow).
+
+## 0.4.11 - combat-text attribution repair
+
+- Targeting/attribution only. The combat transaction is unchanged and frozen: scoped
+  `Stats.ReduceHP` capture, virtual HP, damage values, mitigation, native spell use, proc handling,
+  lifesteal/healing, AoE containment, spectator combat, yield thresholds, the 60-second timer, the
+  Cleaning lifecycle, post-duel NPC target restoration, and the Sim Actions UI are all untouched.
+- Fixed player-facing combat text showing impossible lines during a duel, e.g.
+  `Dancer attacks Dancer for 38 damage.` and `Dancer BACKSTABS Dancer for 427 damage!`, while the
+  damage ledger itself remained correct.
+- Root cause (verified against the currently installed `Assembly-CSharp.dll`): native Erenshor
+  builds its combat-log line entirely from the acting NPC's own GameObject name and its
+  `CurrentAggroTarget`'s GameObject name - `NPC.PerformMeleeHit` emits
+  `base.transform.name + " attacks " + CurrentAggroTarget.transform.name`, and the skill variant
+  emits the same two sources around `_skill.NPCUses`. Native code never consults Duel. Several
+  native routines inside a single `NPC.DoNonRaidBehavior` frame assign `CurrentAggroTarget` with a
+  direct field store - notably `NPC.CheckAssist`, whose group-assist branch copies
+  `GameData.PlayerControl.CurrentTarget` verbatim onto every grouped Sim. Because Duel deliberately
+  pins the player's target to the duel opponent, the opponent's own `CheckAssist` can park it on
+  **itself**, and `Combat()` then runs in that same frame - rendering `<Sim> attacks <Sim>` a full
+  frame before the controller's per-frame pin could correct it.
+- Fix: correct the Duel-owned targeting state at the moment native code reads it, rather than
+  patching, suppressing, or reconstructing any combat text. A prefix on `NPC.Combat` (inert unless a
+  duel is active **and** that exact NPC is one of its two participants) re-pins a participant onto
+  its duel opponent, and the existing `CheckAssist` hook now corrects duelists forward instead of
+  skipping them. Genuine hostile-world PvE aggro still outranks the duel pin, exactly as the
+  per-frame pin already allowed, so world PvE combat text remains completely vanilla.
+- The decision itself is a new pure, Unity-free `DuelCombatAttributionPolicy` used by production
+  and covered by deterministic self-tests for all four attribution directions (player->Sim,
+  Sim->player, spectator first->second, second->first), the non-aliasing invariant, hostile-world
+  PvE precedence, and non-participant/world combat being untouched.
+- Added a bounded, throttled `combat_text_attribution` diagnostic (mode / source and target role /
+  native display names / current aggro and player target roles / damage entry) that fires only when
+  a correction is actually applied, to confirm the source in live retest.
+
+## 0.4.10 - Cleaning-gate live repair (repeated duels)
+
+- Lifecycle/admission only; virtual HP, ReduceHP capture, damage calculation, spell admission,
+  native Sim AI, self-heal handling, spectator combat, AoE, world damage, yield thresholds, the
+  60-second max fight duration, and NPC target restoration are all unchanged and frozen.
+- Fixed a live defect where, after a duel completed normally, a second duel could not be started:
+  the game correctly reported `Active -> Cleaning`, but `Cleaning -> Idle` never appeared during
+  play - only at application shutdown. Root cause: `RunPostDuelAttackCleanup`'s top fast-exit
+  guard and its bottom "finalize now" decision used the exact same condition
+  (`frames <= 0 && time >= deadline`). The 6-frame settle budget is always spent within a handful
+  of ordinary frames, long before the 0.75s time deadline, so by the frame the deadline was
+  finally reached, the frame budget had already gone to zero on an earlier frame - meaning the TOP
+  guard fired and returned before the bottom code could ever call `EndPostDuelAttackCleanup()`.
+  Nothing else called it again except `Shutdown()`'s direct, unconditional call at application
+  exit, exactly matching the reported symptom.
+- Fix: an explicit `_postDuelCleanupPending` flag now gates the top of the function, set only by
+  `BeginPostDuelAttackCleanup` and cleared only by `EndPostDuelAttackCleanup`. The actual
+  finalize decision is now a single pure, independently-tested function
+  (`DuelSafetyPolicy.ShouldFinalizeCleanupPass`), consulted once per tick instead of twice with
+  overlapping semantics. The 6-frame/0.75s safety window and every native-state restoration step
+  are byte-for-byte unchanged.
+- Added a bounded `cleanup_tick` diagnostic (state/now/cleanupUntil/cleanupPassComplete/
+  admissionBlocked/reason) logged at cleanup start, cleanup completion, and at most once per
+  rejected challenge during Cleaning - never per frame.
+- Added a pure-logic regression proof: the deterministic self-tests now simulate both the OLD
+  (buggy) combined-guard shape and the NEW pending-flag shape across two full simulated seconds at
+  60fps, using the exact same production decision function, proving the old shape never finalizes
+  and the new shape reliably does.
+
+## 0.4.9 - Sim Actions fallback UI geometry repair
+
+- UI geometry only; combat transaction, lifecycle, target restoration, the 60-second timer, and
+  Follow compatibility are unchanged and frozen.
+- Fixed the standalone **SIM ACTIONS** fallback panel rendering with a large empty cyan block above
+  a header that appeared far below the panel's actual top edge, with content pushed down and
+  overlapping the header/body boundary. Root cause: the panel's body background (`inner`) was built
+  with a fixed size that never tracked the panel's own height, which grows every time content
+  changes; the header was anchored to that stale fixed-size body's bottom instead of its top, so
+  both drifted away from the panel's real, dynamically-grown bounds. `inner` now stretch-anchors to
+  the live panel bounds (with a deliberate 1px accent border) and the header top-anchors within it,
+  so header/body/panel always agree on one coordinate system with no separate resize bookkeeping.
+- Panel width increased from 220px to 260px (within the intended 240-300px compact range). Header
+  height is a single named 30px constant. Selected-Sim menu, Choosing-Opponent, and Sim-vs-Sim
+  Confirm all share the same corrected row/button geometry, since they were already built from the
+  same shared hierarchy - fixing it once fixes all three states and the inline rejection/status text.
+- Added a 23-assertion source geometry matrix asserting header height/panel width bounds, top
+  anchoring, body-starts-below-header, bounded button heights, content-driven panel height, and that
+  Follow suppression behavior is unchanged.
+
+## 0.4.8 - mouse-click Sim Actions discoverability
+
+- Combat transaction and lifecycle (0.4.4-0.4.7) are unchanged and frozen; this is a presentation
+  workstream only.
+- Fixed the core standalone UX gap: with Duel installed alone, clicking a Sim opened no menu at all,
+  and Sim-vs-Sim spectator duels were reachable only through `/eduel <Sim A> vs <Sim B>` from the
+  README. Clicking an eligible local Sim now opens a small retained **SIM ACTIONS** menu exposing
+  **Practice Duel** (player-vs-Sim) and **Arrange Sim Duel** (spectator), styled to match the same
+  dark/translucent/cyan presentation the rest of the collection uses.
+- Ownership rule: **Erenshor Follow owns the full Sim Actions system whenever Follow is installed and
+  healthy.** Added `DuelFollowCompatibility`, a reflection-only (no compile-time reference) probe of
+  Follow's public `FollowControlApi.GetStatus()`, classified by the new pure
+  `DuelFollowCompatibilityPolicy.ClassifyStatus`. Duel's own native-click observation
+  (`PlayerControl.LeftClick` / `Character.TargetMe`, the same hook points Follow's own Sim Actions
+  menu uses) checks this live at every entry point and stands down immediately whenever Follow is
+  healthy, so there is exactly one Sim Actions interaction regardless of load order, and Follow
+  becoming healthy while the fallback is open disposes it cleanly on the very next tick.
+- Arrange Sim Duel is a small click-to-click state machine (`DuelSimActionsFallbackPolicy`, pure and
+  unit-tested): click a Sim, choose Arrange Sim Duel, click a second eligible local Sim, confirm with
+  Start/Cancel. The same Sim cannot be picked for both sides; an ineligible second Sim is rejected
+  with the real reason and the picker stays open; a first or second Sim that becomes hard-invalid
+  (gone, dead, wrong zone) before confirmation cancels cleanly with an explanation rather than
+  failing silently or leaving stale state behind.
+- Both the click path and `/eduel` now provably share one eligibility decision and one start path:
+  `DuelController.EvaluateEligibility` was widened from `private` to `internal` so the fallback UI
+  calls it directly instead of re-implementing it, and both **Practice Duel**/**Start** call the
+  existing `DuelController.Start`/`StartSpectator` entry points unchanged. `DuelController.
+  ReportEligibilityFailure`'s chat wording and the new inline rejection text now both come from one
+  new shared function, `DuelEligibilityPolicy.DescribeForUi`, instead of two copies of the same
+  strings.
+- No combat, eligibility, or lifecycle logic was duplicated, and no second spectator-combat system
+  was introduced; `StartSpectator` remains the only place a spectator duel actually starts.
+- `/eduel <SimName>`, `/eduel <Sim A> vs <Sim B>`, `/eduel nearby`, `/eduel status`, `/eduel diag`,
+  `/eduel selftest`, and `/eduel stop` are all unchanged and still work with no Sim Actions menu open.
+- Added a 21-case source-contract matrix pinning the Follow stand-down behavior, the shared
+  eligibility/start paths, the no-hard-Follow-reference rule, and the unchanged command path, plus
+  full pure self-test coverage for the classification and state-machine policies. All pre-existing
+  0.4.4-0.4.7 combat/lifecycle/Cleaning-gate matrices (94 cases) pass unchanged.
+
+## 0.4.7 - release candidate: faster Cleaning gate, 60s fights, standalone discoverability
+
+- Semi-tested release candidate; combat transaction (0.4.4-0.4.6) is unchanged and frozen.
+- Investigated the live report of a stuck Cleaning gate ("Finishing cleanup from the previous
+  duel. Try again in a moment." on repeated retry). Root cause: `Tick()` already called the
+  post-duel maintenance pass (`RunPostDuelAttackCleanup`) ahead of its own `!Active` early return,
+  so Cleaning was never actually starved of ticks - but `BeginPostDuelAttackCleanup` required both
+  a 6-frame scrub **and** a full ~2 real seconds to elapse before the gate could open, so a player
+  retrying within that window was correctly refused every time, and at ~2 seconds that reads as
+  stuck. `Tick()` is now split into `TickPostDuelMaintenance()` (always runs, every lifecycle
+  state, no Active/`_state` gate of its own) and `TickCombatSession()` (owns the Preparing/
+  Countdown/Active state machine and is the only half gated on `Active`), so the "maintenance
+  keeps running through Cleaning" property is now structural rather than an emergent side effect
+  of call order.
+- Added a named `PostDuelCleanupSeconds = 0.75f` constant (replacing a scattered `2f` literal) so
+  the visible Cleaning gate targets roughly 0.75 seconds under normal operation instead of ~2. The
+  existing `PostDuelCleanupFrames = 6` multi-frame native target/attack scrub is preserved
+  unchanged - the gate is faster, not skipped.
+- Raised the Practice Duel active-fight timeout from 30 to 60 seconds via a single named
+  `MaximumFightSeconds` constant; the timeout chat message now derives from the same constant
+  instead of a hardcoded "30 seconds" string. Countdown (3s), acceptance delay (1s), and the
+  recent-duel cooldown (120s) are unchanged.
+- Standalone discoverability: with no Suite Hub and no Follow installed, the existing retained
+  fallback panel's status line now names the actual eligible local Sims (bounded, with a "+N more"
+  overflow) instead of only a count, and its guide text now spells out
+  `Sim vs Sim: /eduel <Sim A> vs <Sim B>` so spectator mode is discoverable without a README
+  lookup. The existing Challenge Nearby / Stop Duel buttons and status text are unchanged; no
+  per-Sim dynamic buttons were added, since that would require expanding the shared
+  `StandaloneFallbackUi` framework, which this workstream does not modify.
+- Added deterministic coverage: an explicit "Cleaning admits no virtual combat, and a challenge is
+  accepted immediately once CleanupComplete fires" assertion in the pure lifecycle self-tests, plus
+  a 14-case source-contract matrix (Tick/TickCombatSession/TickPostDuelMaintenance structure, the
+  60s/0.75s named constants, shared StopInternal path for manual stop and timeout, and the
+  "new unrelated target during Cleaning is not stomped" guard) and a 3-case standalone
+  discoverability guard. All pre-existing 0.4.4-0.4.6 combat forensic/recovery matrices (63 cases)
+  pass unchanged.
+
 ## 0.4.6 - NPC self-cast misclassification and diagnostic truncation
 
 - Fixed the opposing duelist's offensive spells being resolved onto the caster. A live duel recorded

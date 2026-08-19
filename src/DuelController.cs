@@ -121,15 +121,45 @@ namespace ErenshorDuel
         private static bool _postDuelStopLocalPlayer;
         private static int _postDuelAttackCleanupFrames;
         private static float _postDuelAttackCleanupUntil;
+        // True from the moment a cleanup pass is armed until EndPostDuelAttackCleanup() actually
+        // runs. _postDuelAttackCleanupFrames and _postDuelAttackCleanupUntil both reach their
+        // "spent" values on the SAME frame in ordinary play - the 6-frame budget is exhausted in a
+        // handful of frames, long before the 0.75s deadline - so a completion check built only from
+        // those two fields cannot tell "just became due, still need to finalize" apart from
+        // "already finalized last frame". A single shared (frames<=0 && time>=until) condition used
+        // at both the top (fast-exit once idle) and the bottom (decide to finalize) of
+        // RunPostDuelAttackCleanup meant that on the exact frame both conditions first became true,
+        // the TOP guard fired and returned before EndPostDuelAttackCleanup() was ever reached -
+        // leaving Cleaning latched indefinitely until Shutdown() forced it at application exit.
+        private static bool _postDuelCleanupPending;
+        // Every NPC whose native Combat() frame is currently on the stack, plus any
+        // CurrentAggroTarget write that arrived while it was. See SetAggroTargetSafely for why the
+        // write must not land until that frame returns.
+        private static readonly HashSet<NPC> NpcsInsideNativeCombat = new HashSet<NPC>();
+        private static readonly Dictionary<NPC, Character> DeferredAggroTargets = new Dictionary<NPC, Character>();
         private static readonly MethodInfo ResetNpcAttackAnimationsMethod = AccessTools.Method(typeof(NPC), "ResetAttackAnimations");
         private static readonly FieldInfo NpcCombatantsField = AccessTools.Field(typeof(NPC), "Combatants");
+        // Native NPC.Combat dereferences NPC.MyStats directly (ldfld Stats NPC::MyStats), but the
+        // field is not publicly accessible from a plugin. Read it reflectively for diagnostics only.
+        private static readonly FieldInfo NpcMyStatsField = AccessTools.Field(typeof(NPC), "MyStats");
         private static readonly MethodInfo CountStatusEffectsMethod = AccessTools.Method(typeof(Stats), "CountStatusEffects");
         private static readonly FieldInfo PlayerAutoattackField = AccessTools.Field(typeof(PlayerCombat), "Autoattack");
         private const int FinishPercent = 5;
         private const float ChallengeDistance = 25f;
         private const float MaximumDistance = 35f;
-        private const float MaximumFightSeconds = 30f;
+        private const float MaximumFightSeconds = 60f;
         private const float RecentDuelCooldownSeconds = 120f;
+        // Technical double-input guard for an EXPLICIT player request, deliberately tiny: it
+        // exists only to swallow one duplicated click/command immediately after
+        // Cleaning -> Idle. The real inter-duel safety window is the Cleaning interval, which
+        // the lifecycle state machine enforces separately. This is NOT a social cooldown.
+        private const float ExplicitRequestDebounceSeconds = 1f;
+        // Visible post-duel Cleaning gate. Kept well above zero because the multi-frame scrub below
+        // (PostDuelCleanupFrames) needs several real frames for native target/attack state to
+        // settle; kept well below the old ~2s window so a second challenge stops being refused
+        // almost as soon as the previous duel's teardown is actually done.
+        private const float PostDuelCleanupSeconds = 0.75f;
+        private const int PostDuelCleanupFrames = 6;
         // Matches DuelChallengePolicy's DeclineLowHealth threshold for the target Sim, applied
         // symmetrically to the player as a Start() precondition.
         private const int MinimumPlayerHealthPercent = 35;
@@ -142,13 +172,13 @@ namespace ErenshorDuel
             DuelLifecycleState next;
             if (!DuelLifecyclePolicy.TryTransition(_state, trigger, out next))
             {
-                Diagnostic("state_transition_rejected from=" + _state + " trigger=" + trigger + " reason=" + SafeLabel(reason));
+                LifecycleDiagnostic("state_transition_rejected from=" + _state + " trigger=" + trigger + " reason=" + SafeLabel(reason));
                 return false;
             }
             DuelLifecycleState previous = _state;
             _state = next;
             _stateStartedAt = Time.unscaledTime;
-            Diagnostic("state_transition " + previous + "->" + next + " trigger=" + trigger + " reason=" + SafeLabel(reason));
+            LifecycleDiagnostic("state_transition " + previous + "->" + next + " trigger=" + trigger + " reason=" + SafeLabel(reason));
             return true;
         }
 
@@ -202,10 +232,13 @@ namespace ErenshorDuel
             return partial;
         }
 
-        internal static void Start(SimPlayer target)
+        // origin is REQUIRED (no default) so a future autonomous/Nemesis caller cannot silently
+        // inherit explicit-player treatment and bypass the social cooldown by omission.
+        internal static void Start(SimPlayer target, DuelRequestOrigin origin)
         {
             if (!CanStartNewDuel)
             {
+                if (_state == DuelLifecycleState.Cleaning) LogCleanupTick("challenge_rejected_during_cleaning");
                 Say(_state == DuelLifecycleState.Cleaning
                     ? "[Practice Duel] Finishing cleanup from the previous duel. Try again in a moment."
                     : "[Practice Duel] Finish or stop the current duel before issuing another challenge.", "yellow");
@@ -239,7 +272,7 @@ namespace ErenshorDuel
             }
 
             string stableKey = StableSimKey(target);
-            DuelSocialDecision decision = EvaluateWillingness(target, player, simCharacter, partySim, stableKey);
+            DuelSocialDecision decision = EvaluateWillingness(target, player, simCharacter, partySim, stableKey, origin);
             string simName = ReadName(target);
 
             Say("[Practice Duel] You challenge " + simName + ".", "lightblue");
@@ -298,6 +331,8 @@ namespace ErenshorDuel
                 EmergencyCleanup("Start.StateTransition");
                 return;
             }
+            LifecycleDiagnostic("duel_start build=" + DuelBuildInfo.Id + " mode=player opponent=" + SafeLabel(_simName) +
+                " scope=" + (_simWasParty ? "party" : "nearby"));
             DiagnosticRecord("duel_start build=" + DuelBuildInfo.Id +
                 " playerReal=" + _playerRealHp + "/" + _playerMax +
                 " opponentReal=" + _simRealHp + "/" + _simMax +
@@ -316,9 +351,30 @@ namespace ErenshorDuel
             }
         }
 
+        // Tick() has two independent responsibilities that must not share a gate: the virtual-combat
+        // session state machine (Preparing/Countdown/Active), and Cleaning's post-duel target/attack
+        // maintenance. The maintenance pass runs every frame regardless of session state - Cleaning
+        // is specifically the state where Active is already false - so it is always serviced up to
+        // Idle even though no combat session owns the frame anymore.
         internal static void Tick()
         {
+            TickPostDuelMaintenance();
+            TickCombatSession();
+        }
+
+        // Always runs, in every lifecycle state, so a pending Cleaning teardown is never starved by
+        // an early return elsewhere. RunPostDuelAttackCleanup is itself a no-op once its own
+        // frame/time budget is spent; it does not read or depend on Active/_state session gates.
+        private static void TickPostDuelMaintenance()
+        {
             RunPostDuelAttackCleanup();
+        }
+
+        // Owns only the virtual-combat session state machine. Deliberately excludes Cleaning: once
+        // Terminal has fired, this method has nothing left to own and must not admit any further
+        // virtual-combat mutation.
+        private static void TickCombatSession()
+        {
             if (!Active) return;
             if (DuelSafetyPolicy.CancelForSceneMismatch(true, PlayerStillInStartingScene())) { Cancel("Tick.Zone", null, null, null, "Duel cancelled after changing zones."); return; }
             if (!ParticipantsAreValid()) { Cancel("Tick.Participants", null, null, null, "Duel cancelled because a duelist is no longer available."); return; }
@@ -383,7 +439,7 @@ namespace ErenshorDuel
                 MirrorVirtualHealth();
                 if (elapsed >= MaximumFightSeconds)
                 {
-                    Stop("Practice duel timed out after 30 seconds. No winner.");
+                    Stop("Practice duel timed out after " + ((int)MaximumFightSeconds).ToString(System.Globalization.CultureInfo.InvariantCulture) + " seconds. No winner.");
                     return;
                 }
                 // Keep the duel target only while native AI has not selected a verified hostile
@@ -431,6 +487,7 @@ namespace ErenshorDuel
             AllowedDuelPets.Clear();
             EngagedPets.Clear();
             PostDuelPetNpcs.Clear();
+            ClearNativeCombatScopes();
             _effectTickOwner = null;
         }
 
@@ -462,6 +519,8 @@ namespace ErenshorDuel
             bool autoAttackBefore = ReadPlayerAutoattack();
             string targetBefore = DescribeActor(GameData.PlayerControl == null ? null : GameData.PlayerControl.CurrentTarget);
             bool externalCombatPresent = HasUnsafeRealCombat(_player, _sim, _simNpc);
+            LifecycleDiagnostic("duel_terminal reason=" + SafeLabel(reason) + " active=" + wasActive +
+                " cleanup=" + hadDuelState);
             DiagnosticRecord("duel_terminal reason=" + SafeLabel(reason) + " active=" + wasActive +
                 " cleanup=" + hadDuelState + " autoAttackBefore=" + autoAttackBefore +
                 " targetBefore=" + targetBefore + " externalCombatPresent=" + externalCombatPresent);
@@ -482,6 +541,7 @@ namespace ErenshorDuel
             RestoreRealHealthAndEffects();
             PurgeDuelistsFromNearbyEnemies();
             ReleaseEngagedPets();
+            Diagnostic(DescribeNpcCleanupState("npc_cleanup_before sim", _simNpc, _simPlayer, _sim));
             if (_simNpc != null || _simPlayer != null)
             {
                 try
@@ -493,8 +553,8 @@ namespace ErenshorDuel
                         bool previousTargetIsDuelist = _previousSimTarget == _player || _previousSimTarget == _sim;
                         if (currentTargetIsDuelOwned)
                         {
-                            _simNpc.CurrentAggroTarget = DuelSafetyPolicy.ShouldRestorePreviousNpcTarget(
-                                true, IsAlive(_previousSimTarget), previousTargetIsDuelist) ? _previousSimTarget : null;
+                            SetAggroTargetSafely(_simNpc, DuelSafetyPolicy.ShouldRestorePreviousNpcTarget(
+                                true, CanSafelyRestoreAsNativeTarget(_previousSimTarget), previousTargetIsDuelist) ? _previousSimTarget : null);
                         }
                         if (_simNpc.PastAggroTarget == _player || _simNpc.PastAggroTarget == _sim)
                             _simNpc.PastAggroTarget = null;
@@ -527,7 +587,7 @@ namespace ErenshorDuel
                         // (including an external combat target), never a duelist.
                         bool priorIsDuelist = _previousPlayerTarget == _player || _previousPlayerTarget == _sim;
                         GameData.PlayerControl.CurrentTarget = DuelSafetyPolicy.ShouldRestorePreviousTarget(
-                            IsAlive(_previousPlayerTarget), priorIsDuelist) ? _previousPlayerTarget : null;
+                            CanSafelyRestoreAsNativeTarget(_previousPlayerTarget), priorIsDuelist) ? _previousPlayerTarget : null;
                     }
                 }
                 catch { }
@@ -544,8 +604,8 @@ namespace ErenshorDuel
                         bool previousTargetIsDuelist = _previousFirstSimTarget == _player || _previousFirstSimTarget == _sim;
                         if (currentTargetIsDuelOwned)
                         {
-                            _firstSimNpc.CurrentAggroTarget = DuelSafetyPolicy.ShouldRestorePreviousNpcTarget(
-                                true, IsAlive(_previousFirstSimTarget), previousTargetIsDuelist) ? _previousFirstSimTarget : null;
+                            SetAggroTargetSafely(_firstSimNpc, DuelSafetyPolicy.ShouldRestorePreviousNpcTarget(
+                                true, CanSafelyRestoreAsNativeTarget(_previousFirstSimTarget), previousTargetIsDuelist) ? _previousFirstSimTarget : null);
                         }
                         if (_firstSimNpc.PastAggroTarget == _player || _firstSimNpc.PastAggroTarget == _sim)
                             _firstSimNpc.PastAggroTarget = null;
@@ -556,6 +616,10 @@ namespace ErenshorDuel
                 }
                 catch { }
             }
+
+            Diagnostic(DescribeNpcCleanupState("npc_cleanup_after sim", _simNpc, _simPlayer, _sim));
+            if (_spectatorDuel)
+                Diagnostic(DescribeNpcCleanupState("npc_cleanup_after first", _firstSimNpc, _firstSimPlayer, _player));
 
             RestorePartyMovementOwnership();
 
@@ -608,13 +672,15 @@ namespace ErenshorDuel
             _postDuelFirstSimNpc = _firstSimNpc;
             SnapshotPostDuelPets();
             _postDuelStopLocalPlayer = !_spectatorDuel;
-            _postDuelAttackCleanupFrames = 6;
-            _postDuelAttackCleanupUntil = Time.unscaledTime + 2f;
+            _postDuelAttackCleanupFrames = PostDuelCleanupFrames;
+            _postDuelAttackCleanupUntil = Time.unscaledTime + PostDuelCleanupSeconds;
+            _postDuelCleanupPending = true;
+            LogCleanupTick("cleanup_started");
         }
 
         private static void RunPostDuelAttackCleanup()
         {
-            if (_postDuelAttackCleanupFrames <= 0 && Time.unscaledTime >= _postDuelAttackCleanupUntil) return;
+            if (!_postDuelCleanupPending) return;
             try
             {
                 if (_postDuelStopLocalPlayer && GameData.PlayerControl != null)
@@ -640,7 +706,7 @@ namespace ErenshorDuel
                 if (_postDuelSimNpc != null)
                 {
                     if (_postDuelSimNpc.CurrentAggroTarget == _postDuelPlayer || _postDuelSimNpc.CurrentAggroTarget == _postDuelSim)
-                        _postDuelSimNpc.CurrentAggroTarget = null;
+                        SetAggroTargetSafely(_postDuelSimNpc, null);
                     if (_postDuelSimNpc.PastAggroTarget == _postDuelPlayer || _postDuelSimNpc.PastAggroTarget == _postDuelSim)
                         _postDuelSimNpc.PastAggroTarget = null;
                     ResetNpcAttackAnimations(_postDuelSimNpc);
@@ -648,7 +714,7 @@ namespace ErenshorDuel
                 if (_postDuelFirstSimNpc != null)
                 {
                     if (_postDuelFirstSimNpc.CurrentAggroTarget == _postDuelPlayer || _postDuelFirstSimNpc.CurrentAggroTarget == _postDuelSim)
-                        _postDuelFirstSimNpc.CurrentAggroTarget = null;
+                        SetAggroTargetSafely(_postDuelFirstSimNpc, null);
                     if (_postDuelFirstSimNpc.PastAggroTarget == _postDuelPlayer || _postDuelFirstSimNpc.PastAggroTarget == _postDuelSim)
                         _postDuelFirstSimNpc.PastAggroTarget = null;
                     ResetNpcAttackAnimations(_postDuelFirstSimNpc);
@@ -658,12 +724,36 @@ namespace ErenshorDuel
             }
             catch { }
             _postDuelAttackCleanupFrames--;
-            if (_postDuelAttackCleanupFrames > 0 || Time.unscaledTime < _postDuelAttackCleanupUntil) return;
+            if (!DuelSafetyPolicy.ShouldFinalizeCleanupPass(_postDuelAttackCleanupFrames, Time.unscaledTime, _postDuelAttackCleanupUntil)) return;
             EndPostDuelAttackCleanup();
+        }
+
+        // Any disarm that was deferred because a native NPC.Combat frame was still on the stack is
+        // applied here once that frame has returned, so Cleaning never completes while a duel-owned
+        // target is still pinned. An NPC still inside Combat keeps its pending write; its own
+        // finalizer applies it the moment the native frame unwinds.
+        private static void FlushDeferredAggroTargets()
+        {
+            if (DeferredAggroTargets.Count == 0) return;
+            List<NPC> ready = new List<NPC>();
+            foreach (KeyValuePair<NPC, Character> entry in DeferredAggroTargets)
+                if (entry.Key == null || !NpcsInsideNativeCombat.Contains(entry.Key)) ready.Add(entry.Key);
+            for (int i = 0; i < ready.Count; i++)
+            {
+                NPC npc = ready[i];
+                Character pending;
+                if (!DeferredAggroTargets.TryGetValue(npc, out pending)) continue;
+                DeferredAggroTargets.Remove(npc);
+                if (npc == null) continue;
+                try { npc.CurrentAggroTarget = pending; } catch { }
+                ResetNpcAttackAnimations(npc);
+            }
         }
 
         private static void EndPostDuelAttackCleanup()
         {
+            FlushDeferredAggroTargets();
+            _postDuelCleanupPending = false;
             _postDuelAttackCleanupFrames = 0;
             _postDuelAttackCleanupUntil = 0f;
             _postDuelPlayer = null;
@@ -674,13 +764,35 @@ namespace ErenshorDuel
             PostDuelPetNpcs.Clear();
             if (_state == DuelLifecycleState.Cleaning)
             {
+                // This transition intentionally bypasses the shared Transition() wrapper (it needs
+                // a hard Idle fallback even if the policy somehow rejects CleanupComplete, which
+                // Transition() does not provide), which meant it was the one state change in the
+                // whole lifecycle that never emitted the "state_transition A->B" line every other
+                // transition does - the visible Cleaning->Idle line was structurally missing from
+                // logs, not functionally skipped. Log it explicitly here instead, in the exact same
+                // format, so it is observable the same way every other transition already is.
+                DuelLifecycleState previous = _state;
                 DuelLifecycleState next;
                 if (DuelLifecyclePolicy.TryTransition(_state, DuelLifecycleTrigger.CleanupComplete, out next))
                     _state = next;
                 else
                     _state = DuelLifecycleState.Idle;
                 _stateStartedAt = 0f;
+                LifecycleDiagnostic("state_transition " + previous + "->" + _state + " trigger=CleanupComplete reason=post-duel cleanup complete");
             }
+            LogCleanupTick("cleanup_completed");
+        }
+
+        // Bounded diagnostic for the post-duel cleanup gate: at most once per cleanup
+        // start/completion or once per rejected challenge - never per frame.
+        private static void LogCleanupTick(string reason)
+        {
+            LifecycleDiagnostic("cleanup_tick state=" + _state +
+                " now=" + Time.unscaledTime.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture) +
+                " cleanupUntil=" + _postDuelAttackCleanupUntil.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture) +
+                " cleanupPassComplete=" + (!_postDuelCleanupPending) +
+                " admissionBlocked=" + (!CanStartNewDuel) +
+                " reason=" + SafeLabel(reason));
         }
 
         private static void ResetNpcAttackAnimations(NPC npc)
@@ -756,7 +868,7 @@ namespace ErenshorDuel
                 Character first = _postDuelPlayer != null ? _postDuelPlayer : _player;
                 Character second = _postDuelSim != null ? _postDuelSim : _sim;
                 if (npc.CurrentAggroTarget == first || npc.CurrentAggroTarget == second)
-                    npc.CurrentAggroTarget = null;
+                    SetAggroTargetSafely(npc, null);
                 if (npc.PastAggroTarget == first || npc.PastAggroTarget == second)
                     npc.PastAggroTarget = null;
                 System.Collections.IList combatants = NpcCombatantsField == null ? null :
@@ -776,10 +888,13 @@ namespace ErenshorDuel
             catch { }
         }
 
-        internal static void StartSpectator(SimPlayer first, SimPlayer second)
+        // origin is REQUIRED for the same reason as Start(): an autonomous caller must state
+        // itself rather than default into the explicit-player window.
+        internal static void StartSpectator(SimPlayer first, SimPlayer second, DuelRequestOrigin origin)
         {
             if (!CanStartNewDuel)
             {
+                if (_state == DuelLifecycleState.Cleaning) LogCleanupTick("challenge_rejected_during_cleaning");
                 Say(_state == DuelLifecycleState.Cleaning
                     ? "[Practice Duel] Finishing cleanup from the previous duel. Try again in a moment."
                     : "[Practice Duel] Finish or stop the current duel before issuing another challenge.", "yellow");
@@ -830,7 +945,7 @@ namespace ErenshorDuel
 
             string firstKey = StableSimKey(first);
             string secondKey = StableSimKey(second);
-            if (WasRecentlyAccepted(firstKey) || WasRecentlyAccepted(secondKey))
+            if (WasRecentlyAccepted(firstKey, origin) || WasRecentlyAccepted(secondKey, origin))
             {
                 Say("[Practice Duel] One of those Sims needs a moment before another duel.", "lightblue");
                 return;
@@ -899,7 +1014,7 @@ namespace ErenshorDuel
                 return;
             }
             Say("[Practice Duel] " + _firstSimName + " challenges " + _simName + ".", "lightblue");
-            Diagnostic("duel_start mode=spectator first=" + SafeLabel(_firstSimName) + " second=" + SafeLabel(_simName));
+            LifecycleDiagnostic("duel_start mode=spectator first=" + SafeLabel(_firstSimName) + " second=" + SafeLabel(_simName));
         }
 
         private static bool ReadPlayerAutoattack()
@@ -924,6 +1039,7 @@ namespace ErenshorDuel
         private static void DiagnosticVirtual(string kind, string source, bool playerTarget, int nativeAmount,
             int virtualDelta, int before, int after, int maximum, int realBefore, int realAfter, string reason)
         {
+            if (!ErenshorDuelPlugin.VerboseDiagnostics) return;
             bool yields = after <= YieldThreshold(maximum);
             DiagnosticRecord(kind + " target=" + (playerTarget ? "player" : SafeLabel(_simName)) +
                 " source=" + SafeLabel(source) + " native=" + nativeAmount +
@@ -1301,7 +1417,8 @@ namespace ErenshorDuel
             try { remote = CoopCompatibility.IsRemoteHuman(sim); } catch { }
             string willingness = "n/a";
             if (eligibility == DuelEligibilityDecision.Eligible)
-                willingness = DuelChallengePolicy.Token(EvaluateWillingness(sim, player, actor, party, StableSimKey(sim)));
+                willingness = DuelChallengePolicy.Token(EvaluateWillingness(sim, player, actor, party,
+                    StableSimKey(sim), DuelRequestOrigin.ExplicitPlayer));
             Diagnostic("nearby_candidate name=" + SafeLabel(ReadName(sim)) +
                 " distance=" + (distance == float.MaxValue ? "n/a" : distance.ToString("0.0")) +
                 " party=" + party + " activeScenePass=" + activePass +
@@ -2885,6 +3002,201 @@ namespace ErenshorDuel
         // a duelist mid-match. Snapshot the target around the routine and undo it if the routine
         // parked the NPC on a duelist, rather than suppressing assist behaviour wholesale -- a party
         // Sim assisting against a real mob elsewhere is legitimate and must keep working.
+        // Slot-based duel role for a live actor. _player is the FirstParticipant slot in BOTH modes
+        // (the local player in a player-vs-Sim duel, the first Sim in a spectator duel), so the pure
+        // attribution rules never need to know which mode is running.
+        private static DuelCombatRole DuelCombatRoleOf(Character actor)
+        {
+            if (actor == null) return DuelCombatRole.None;
+            if (actor == _player) return DuelCombatRole.FirstParticipant;
+            if (actor == _sim) return DuelCombatRole.SecondParticipant;
+            return DuelCombatRole.None;
+        }
+
+        // The duel-correct aggro target for a participating NPC: exactly the value Tick() pins each
+        // frame (see the Active-state block). _firstSimNpc only exists in spectator mode.
+        internal static Character DuelOpponentForNpc(NPC npc)
+        {
+            if (!Active || npc == null) return null;
+            if (npc == _simNpc) return _player;
+            if (_spectatorDuel && npc == _firstSimNpc) return _sim;
+            return null;
+        }
+
+        // Native NPC.CheckAssist assigns CurrentAggroTarget with a DIRECT FIELD STORE, and during a
+        // player-vs-Sim duel Duel deliberately pins GameData.PlayerControl.CurrentTarget to the
+        // opponent so the player's own attack loop stays valid. CheckAssist's group-assist branch
+        // copies exactly that value onto every grouped Sim - which includes the opponent itself, so
+        // the opponent can be parked on ITSELF. NPC.DoNonRaidBehavior then calls Combat() in the
+        // SAME native frame, and Combat()/PerformMeleeHit build their combat-log line from
+        // base.transform.name and CurrentAggroTarget.transform.name - producing "<Sim> attacks
+        // <Sim>" a full frame before Tick() can re-pin. Correct the Duel-owned targeting state here,
+        // at the moment native code is about to read it, instead of patching the combat text.
+        //
+        // Returns true when a correction was actually applied.
+        private static bool RepinDuelistCombatTarget(NPC npc, string stage)
+        {
+            try
+            {
+                Character opponent = DuelOpponentForNpc(npc);
+                if (opponent == null) return false;
+                Character acquired = npc.CurrentAggroTarget;
+                Character actor = NpcCharacter(npc);
+                // Before GO the duel pair is NOT armed, so this repair must never pin a participant
+                // onto its opponent - doing so is what let native AI start attacking during
+                // Preparing/Countdown. The attribution repair itself is unchanged for the armed
+                // state it was written for; pre-GO the same participant<->participant edge is
+                // disarmed instead. A participant's real hostile-world target is left alone.
+                if (!DuelArmingPolicy.ShouldArmDuelPair(_state))
+                {
+                    bool acquiredIsOpponent = acquired == opponent;
+                    if (DuelArmingPolicy.ShouldDisarmDuelPairTarget(true, acquiredIsOpponent,
+                            Classify(acquired) == CombatActorClass.OutsideHostile, _state))
+                    {
+                        npc.CurrentAggroTarget = null;
+                        LogPreActiveDuelCombat(npc, acquired, stage, "blocked");
+                    }
+                    return false;
+                }
+                // The decision itself is the pure, unit-tested contract; this method only supplies
+                // live roles and applies the result. The hostile-world exception Tick() already
+                // honours (real PvE aggro outranks the duel pin) is encoded there, not here.
+                if (!DuelCombatAttributionPolicy.ShouldRepin(
+                        DuelCombatRoleOf(actor),
+                        DuelCombatRoleOf(acquired),
+                        Classify(acquired) == CombatActorClass.OutsideHostile))
+                    return false;
+                npc.CurrentAggroTarget = opponent;
+                ThrottledDiagnostic("combat_text_attribution." + SafeLabel(stage),
+                    "combat_text_attribution mode=" + (_spectatorDuel ? "spectator" : "player") +
+                    " stage=" + SafeLabel(stage) +
+                    " sourceRole=" + Classify(actor) +
+                    " sourceNativeName=" + SafeLabel(NativeDisplayName(actor)) +
+                    " targetRole=" + Classify(acquired) +
+                    " targetNativeName=" + SafeLabel(NativeDisplayName(acquired)) +
+                    " currentAggroTargetRole=" + Classify(acquired) +
+                    " playerCurrentTargetRole=" + Classify(SafePlayerCurrentTarget()) +
+                    " repinnedToRole=" + Classify(opponent) +
+                    " damageEntry=" + SafeLabel(stage));
+                return true;
+            }
+            catch { return false; }
+        }
+
+        // The exact string native combat text uses for an actor (Character.transform.name), so a
+        // diagnostic can prove attribution without inventing a second naming scheme. This is the
+        // public mod/actor display name only - never an account, slot, or save identifier.
+        private static string NativeDisplayName(Character actor)
+        {
+            try { return actor == null || actor.transform == null ? "null" : actor.transform.name; }
+            catch { return "unavailable"; }
+        }
+
+        private static Character SafePlayerCurrentTarget()
+        {
+            try { return GameData.PlayerControl == null ? null : GameData.PlayerControl.CurrentTarget; }
+            catch { return null; }
+        }
+
+        // Narrow duel-pair admission gate in front of native NPC.Combat(). Returns false only for
+        // one of the two duel participants, only before GO, and only when that participant's
+        // current target is exactly its duel opponent. Everything else - every world NPC, every
+        // bystander Sim, and a participant genuinely fighting a hostile world actor - returns true
+        // and runs completely vanilla. NPC.Combat is never suppressed globally.
+        //
+        // This closes the melee half of the pre-GO window: NPC.Combat calls PerformMeleeHit
+        // directly (verified in the installed assembly at IL_0314 and IL_048F), which no existing
+        // gate covered. DoAttackSpell/DoAttackSkill were already refused pre-Active by
+        // AllowCombatAction, and every damage/heal/status/spell commit path already returns zero
+        // before Active, so this is the last route by which the pair could act on each other early.
+        internal static bool AdmitNativeCombat(NPC npc)
+        {
+            if (!Active || npc == null) return true;
+            Character opponent = DuelOpponentFor(npc);
+            if (opponent == null) return true;
+            Character current = null;
+            try { current = npc.CurrentAggroTarget; } catch { return true; }
+            bool outsideHostile = Classify(current) == CombatActorClass.OutsideHostile;
+            if (!DuelArmingPolicy.ShouldBlockParticipantCombat(true, current == opponent, outsideHostile, _state))
+                return true;
+
+            // Disarm as well as refuse: leaving the pin in place just re-enters combat next frame.
+            // Safe to write directly - the native body has not started and cannot read it.
+            try { npc.CurrentAggroTarget = null; } catch { }
+            LogPreActiveDuelCombat(npc, current, "NPC.Combat", "blocked");
+            return false;
+        }
+
+        // Bounded (throttled per stage, never per frame) record of a duel-pair combat attempt that
+        // arrived before GO, so the exact native entry point is identifiable from a log.
+        private static void LogPreActiveDuelCombat(NPC npc, Character target, string entry, string action)
+        {
+            try
+            {
+                Character actor = NpcCharacter(npc);
+                ThrottledDiagnostic("preactive_duel_combat." + SafeLabel(entry),
+                    "preactive_duel_combat state=" + _state +
+                    " sourceRole=" + Classify(actor) +
+                    " targetRole=" + Classify(target) +
+                    " entry=" + SafeLabel(entry) +
+                    " currentAggroTarget=" + DescribeActor(target) +
+                    " playerCurrentTarget=" + DescribeActor(SafePlayerCurrentTarget()) +
+                    " action=" + SafeLabel(action));
+            }
+            catch { }
+        }
+
+        internal static bool BeginNativeCombat(NPC npc)
+        {
+            return npc != null && NpcsInsideNativeCombat.Add(npc);
+        }
+
+        internal static void EndNativeCombat(NPC npc)
+        {
+            if (npc == null) return;
+            NpcsInsideNativeCombat.Remove(npc);
+            Character pending;
+            if (!DeferredAggroTargets.TryGetValue(npc, out pending)) return;
+            DeferredAggroTargets.Remove(npc);
+            try { npc.CurrentAggroTarget = pending; } catch { }
+            ResetNpcAttackAnimations(npc);
+        }
+
+        // The ONLY safe way to write a duel-owned NPC.CurrentAggroTarget during teardown.
+        //
+        // Native NPC.Combat() stores into CurrentAggroTarget with no null guard immediately after
+        // its melee hit returns (verified in the installed Assembly-CSharp.dll):
+        //
+        //     IL_0314  call   NPC::PerformMeleeHit(int, bool)
+        //     IL_031A  ldfld  Character NPC::CurrentAggroTarget
+        //     IL_0324  stfld  float Character::RecentDirectHit
+        //
+        // A duel reaching its yield threshold inside that melee hit calls Stop() synchronously from
+        // the damage prefix (see ApplyVirtualDamage), so terminal cleanup used to null
+        // CurrentAggroTarget while the native frame was still on the stack - and the store at
+        // IL_0324 then dereferenced null. That is the exact NullReferenceException seen in
+        // NPC.Combat/NPC.DoNonRaidBehavior after a spectator duel, where both participants drive
+        // Combat() themselves and so are far more likely to deliver the finishing hit from inside
+        // that frame. Deferring the write lets the native frame finish reading a target that is
+        // still a live, valid Character, then applies the real disarm one frame boundary later.
+        // Nothing is caught or swallowed, and no dummy target is ever fabricated.
+        private static void SetAggroTargetSafely(NPC npc, Character value)
+        {
+            if (npc == null) return;
+            if (DuelArmingPolicy.ShouldDeferAggroTargetWrite(NpcsInsideNativeCombat.Contains(npc)))
+            {
+                DeferredAggroTargets[npc] = value;
+                return;
+            }
+            try { npc.CurrentAggroTarget = value; } catch { }
+        }
+
+        private static void ClearNativeCombatScopes()
+        {
+            NpcsInsideNativeCombat.Clear();
+            DeferredAggroTargets.Clear();
+        }
+
         internal static void BeginAssistRoutine(NPC npc, ref Character previousTarget)
         {
             previousTarget = null;
@@ -2892,9 +3204,22 @@ namespace ErenshorDuel
             try { previousTarget = npc.CurrentAggroTarget; } catch { }
         }
 
+        // Called immediately before native NPC.Combat() reads CurrentAggroTarget to build both the
+        // hit and its combat-log line. Scoped strictly to an active duel's own participants; every
+        // other NPC (world PvE, bystander party Sims) is untouched and keeps vanilla behavior.
+        internal static void EnsureDuelistCombatTarget(NPC npc)
+        {
+            if (!Active || npc == null || !IsDuelingNpc(npc)) return;
+            RepinDuelistCombatTarget(npc, "NPC.Combat");
+        }
+
         internal static void FinishAssistRoutine(NPC npc, Character previousTarget)
         {
-            if (!Active || npc == null || IsDuelingNpc(npc)) return;
+            if (!Active || npc == null) return;
+            // A duelist's assist result is corrected forward to its duel opponent rather than
+            // rolled back to a stale pre-assist snapshot: Tick() owns that pin, and CheckAssist can
+            // legitimately have moved it off for a hostile-world target (preserved above).
+            if (IsDuelingNpc(npc)) { RepinDuelistCombatTarget(npc, "NPC.CheckAssist"); return; }
             try
             {
                 Character acquired = npc.CurrentAggroTarget;
@@ -3059,7 +3384,11 @@ namespace ErenshorDuel
                 if (eligibility == DuelEligibilityDecision.Eligible)
                 {
                     string stableKey = StableSimKey(sim);
-                    DuelSocialDecision decision = EvaluateWillingness(sim, player, simCharacter, partySim, stableKey);
+                    // This listing answers "what happens if the player asks right now", so it is
+                    // evaluated as an explicit request - otherwise /eduel nearby would report a
+                    // decline the player would not actually receive.
+                    DuelSocialDecision decision = EvaluateWillingness(sim, player, simCharacter, partySim,
+                        stableKey, DuelRequestOrigin.ExplicitPlayer);
                     status = "eligible decision=" + DuelChallengePolicy.Token(decision);
                 }
                 else status = "unavailable=" + DuelEligibilityPolicy.Token(eligibility);
@@ -3169,7 +3498,10 @@ namespace ErenshorDuel
                 " (full per-candidate detail in the Lunaris log)";
         }
 
-        private static DuelEligibilityDecision EvaluateEligibility(SimPlayer target, Character player,
+        // internal (not private): the standalone Sim Actions fallback (DuelSimActionsFallback) calls
+        // this directly so click-driven eligibility is byte-identical to the /eduel command path and
+        // the existing player-vs-Sim/spectator entry points below. No logic is duplicated for the UI.
+        internal static DuelEligibilityDecision EvaluateEligibility(SimPlayer target, Character player,
             out Character simCharacter, out NPC simNpc, out bool partySim)
         {
             simCharacter = null;
@@ -3248,27 +3580,10 @@ namespace ErenshorDuel
                 " scenePredicateName=active_loaded_zone" +
                 " scenePass=" + IsSimLocalToActiveZone(target == null ? null : target.gameObject, player) +
                 " finalResult=" + DuelEligibilityPolicy.Token(decision));
-            switch (decision)
-            {
-                case DuelEligibilityDecision.RemoteCoop:
-                    Say("[Practice Duel] Remote COOP humans/proxies cannot be challenged.", "yellow");
-                    break;
-                case DuelEligibilityDecision.MissingCombatComponents:
-                    Say("[Practice Duel] That Sim is missing required local combat components.", "yellow");
-                    break;
-                case DuelEligibilityDecision.CampConflict:
-                    Say("[Practice Duel] End Hunt Camp before starting a duel. Relax does not block friendly duels.", "yellow");
-                    break;
-                case DuelEligibilityDecision.TooFar:
-                    Say("[Practice Duel] Move closer before challenging that Sim.", "yellow");
-                    break;
-                case DuelEligibilityDecision.UnsafeRealCombat:
-                    Say("[Practice Duel] That challenge is unsafe while real combat is active.", "yellow");
-                    break;
-                default:
-                    Say("[Practice Duel] Choose a living local SimPlayer in the current scene.", "yellow");
-                    break;
-            }
+            // The exact wording lives in DuelEligibilityPolicy.DescribeForUi so this chat line and the
+            // standalone Sim Actions fallback's inline rejection text can never say different things
+            // for the same decision.
+            Say("[Practice Duel] " + DuelEligibilityPolicy.DescribeForUi(decision), "yellow");
         }
 
         private static bool PlayerHealthAllowsDuel(Character player)
@@ -3314,7 +3629,7 @@ namespace ErenshorDuel
             return false;
         }
 
-        private static DuelSocialDecision EvaluateWillingness(SimPlayer sim, Character player, Character simCharacter, bool partySim, string stableKey)
+        private static DuelSocialDecision EvaluateWillingness(SimPlayer sim, Character player, Character simCharacter, bool partySim, string stableKey, DuelRequestOrigin origin)
         {
             int playerLevel;
             int simLevel;
@@ -3347,21 +3662,28 @@ namespace ErenshorDuel
                 SimLevel = simLevel,
                 // The cooldown applies to party Sims too, not just non-party ones. See
                 // DuelChallengePolicy.Evaluate: the party-Sim auto-accept bypass is checked after
-                // RecentDuel, so it cannot skip the cooldown.
-                RecentDuel = WasRecentlyAccepted(stableKey),
+                // RecentDuel, so it cannot skip the cooldown. Which window counts as "recent" now
+                // depends on who asked - see WasRecentlyAccepted.
+                Origin = origin,
+                RecentDuel = WasRecentlyAccepted(stableKey, origin),
                 StableKey = stableKey
             };
             return DuelChallengePolicy.Evaluate(input);
         }
 
-        private static bool WasRecentlyAccepted(string key)
+        // One ledger, two windows. The stored timestamp is identical for both origins; only the
+        // window applied to it differs, so an explicit request clears the short technical debounce
+        // while an autonomous one still has to wait out the full social cooldown. Pruning below
+        // deliberately keeps entries for the LONGER window so autonomous callers can still see them.
+        private static bool WasRecentlyAccepted(string key, DuelRequestOrigin origin)
         {
             float now = Time.unscaledTime;
             PruneExpiredDuelCooldowns(now);
             float last;
-            return !string.IsNullOrWhiteSpace(key) &&
-                   LastAcceptedDuelBySim.TryGetValue(key, out last) &&
-                   now >= last && now - last < RecentDuelCooldownSeconds;
+            if (string.IsNullOrWhiteSpace(key) || !LastAcceptedDuelBySim.TryGetValue(key, out last)) return false;
+            float window = DuelChallengePolicy.RecentDuelWindowSeconds(
+                origin, RecentDuelCooldownSeconds, ExplicitRequestDebounceSeconds);
+            return now >= last && now - last < window;
         }
 
         private static void RememberAcceptedDuel(string key)
@@ -3478,6 +3800,7 @@ namespace ErenshorDuel
         // occurrence buries the rest of the duel log.
         private static void ThrottledDiagnostic(string key, string message)
         {
+            if (!ErenshorDuelPlugin.VerboseDiagnostics) return;
             try
             {
                 float last;
@@ -3497,6 +3820,7 @@ namespace ErenshorDuel
         // sanitized and bounded at the point they are read.
         private static void DiagnosticRecord(string message)
         {
+            if (!ErenshorDuelPlugin.VerboseDiagnostics) return;
             try
             {
                 if (ErenshorDuelPlugin.Instance == null) return;
@@ -3517,6 +3841,16 @@ namespace ErenshorDuel
             {
                 if (ErenshorDuelPlugin.Instance != null)
                     ErenshorDuelPlugin.Instance.Diagnostic("[Practice Duel] " + SafeLabel(message));
+            }
+            catch { }
+        }
+
+        private static void LifecycleDiagnostic(string message)
+        {
+            try
+            {
+                if (ErenshorDuelPlugin.Instance != null)
+                    ErenshorDuelPlugin.Instance.LifecycleDiagnostic("[Practice Duel] " + SafeLabel(message));
             }
             catch { }
         }
@@ -3835,6 +4169,23 @@ namespace ErenshorDuel
         }
 
         private static bool IsAlive(Character character) { return character != null && character.gameObject != null && character.gameObject.activeInHierarchy && character.Alive; }
+
+        // Character.Alive is a plain bool field maintained independently of MyStats - a Character
+        // can pass IsAlive() (active, Alive flag true) while its own MyStats component has been
+        // separately destroyed (Unity's overridden null check catches a destroyed-but-referenced
+        // component the same way for MyStats as for any other UnityEngine.Object). Native
+        // NPC.Combat's melee path (PerformMeleeHit) dereferences CurrentAggroTarget.MyStats with no
+        // null guard at all, so handing back a pre-duel target reference Duel cannot prove still has
+        // valid Stats is not a safe restoration - it arms a guaranteed native NRE on that NPC's next
+        // attack. Used ONLY at the three post-duel target-restoration decisions in Stop(); IsAlive()
+        // itself stays untouched everywhere else (eligibility checks, virtual-health mirroring
+        // gates, and every other of its ~20 existing call sites), so this closes exactly the
+        // restoration gap without touching frozen combat-transaction/eligibility behavior.
+        private static bool CanSafelyRestoreAsNativeTarget(Character character)
+        {
+            return IsAlive(character) && character.MyStats != null;
+        }
+
         private static int Percent(int value, int maximum) { return maximum <= 0 ? 0 : Mathf.Clamp(Mathf.RoundToInt(value * 100f / maximum), 0, 100); }
 
         private static string ReadName(SimPlayer sim)
@@ -3860,6 +4211,45 @@ namespace ErenshorDuel
                 catch { }
             }
             return sim.gameObject == null ? string.Empty : sim.gameObject.name;
+        }
+
+        // Bounded, role-only (never a player/Sim name or other identifier) snapshot of an NPC's
+        // aggro-target linkage state, emitted exactly twice per Stop() call - once immediately
+        // before Duel's post-duel target-restoration decisions and once immediately after - never
+        // per-frame. Exists purely to make the native state Duel is about to hand back (or just
+        // handed back) directly observable in logs during forensic live testing.
+        private static string DescribeNpcCleanupState(string label, NPC npc, SimPlayer thisSim, Character actor)
+        {
+            bool npcExists = npc != null;
+            bool thisSimExists = thisSim != null;
+            bool actorExists = actor != null;
+            Character currentTarget = npcExists ? npc.CurrentAggroTarget : null;
+            Character pastTarget = npcExists ? npc.PastAggroTarget : null;
+            bool linkageValid = npcExists && actorExists && NpcCharacter(npc) == actor;
+            // Native NPC.Combat dereferences NPC.ThisSim.myIndex and NPC.Myself.Master with raw
+            // field loads (no Unity null check) once NPC.SimPlayer is true, and reads
+            // CurrentAggroTarget.MyStats without a guard. Report each of those exact preconditions
+            // so a post-duel fault can be attributed from the log instead of inferred.
+            bool npcStatsExist = false, thisSimLinkage = false, actorStatsExist = false;
+            try { npcStatsExist = npcExists && NpcMyStatsField != null && (NpcMyStatsField.GetValue(npc) as Stats) != null; } catch { }
+            try { thisSimLinkage = npcExists && npc.ThisSim != null; } catch { }
+            try { actorStatsExist = actorExists && actor.MyStats != null; } catch { }
+            bool insideNativeCombat = npcExists && NpcsInsideNativeCombat.Contains(npc);
+            bool deferredDisarm = npcExists && DeferredAggroTargets.ContainsKey(npc);
+            return label + " npcExists=" + npcExists + " thisSimExists=" + thisSimExists +
+                " actorExists=" + actorExists + " linkageValid=" + linkageValid +
+                " npcMyStatsExists=" + npcStatsExist + " actorMyStatsExists=" + actorStatsExist +
+                " npcThisSimLinkageValid=" + thisSimLinkage +
+                " insideNativeCombat=" + insideNativeCombat + " deferredDisarmPending=" + deferredDisarm +
+                " currentTarget=" + (currentTarget == null ? "null" : Classify(currentTarget).ToString()) +
+                " currentTargetStatsAvailable=" + (currentTarget != null && currentTarget.MyStats != null) +
+                " safeRestoreEligible=" + CanSafelyRestoreAsNativeTarget(currentTarget) +
+                " pastTarget=" + (pastTarget == null ? "null" : Classify(pastTarget).ToString()) +
+                // Unity does not expose a reliable "is this specific coroutine still running" check
+                // from outside; the native BehaviorUpdate coroutine's ownership is not safely
+                // inspectable without fragile reflection into private iterator state, so this is
+                // reported as a fixed, honest value rather than a probe that could itself misread.
+                " behaviorCoroutineOwnership=not-inspectable";
         }
 
         private static string DescribeActor(Character actor)
@@ -3907,7 +4297,7 @@ namespace ErenshorDuel
                     _simNpc.NPCProcOnHit = _previousNpcProc;
                     _simNpc.NPCProcOnHitChance = _previousNpcProcChance;
                     if (_simNpc.CurrentAggroTarget == _player || _simNpc.CurrentAggroTarget == _sim)
-                        _simNpc.CurrentAggroTarget = null;
+                        SetAggroTargetSafely(_simNpc, null);
                     if (_simNpc.PastAggroTarget == _player || _simNpc.PastAggroTarget == _sim)
                         _simNpc.PastAggroTarget = null;
                     ResetNpcAttackAnimations(_simNpc);
@@ -3921,7 +4311,7 @@ namespace ErenshorDuel
                     _firstSimNpc.NPCProcOnHit = _previousFirstNpcProc;
                     _firstSimNpc.NPCProcOnHitChance = _previousFirstNpcProcChance;
                     if (_firstSimNpc.CurrentAggroTarget == _player || _firstSimNpc.CurrentAggroTarget == _sim)
-                        _firstSimNpc.CurrentAggroTarget = null;
+                        SetAggroTargetSafely(_firstSimNpc, null);
                     if (_firstSimNpc.PastAggroTarget == _player || _firstSimNpc.PastAggroTarget == _sim)
                         _firstSimNpc.PastAggroTarget = null;
                     ResetNpcAttackAnimations(_firstSimNpc);
@@ -4172,6 +4562,55 @@ namespace ErenshorDuel
         private static bool Prefix(NPC __instance)
         {
             return DuelController.AllowAggroShare(__instance);
+        }
+    }
+
+    // Native NPC.Combat() reads CurrentAggroTarget to resolve BOTH the hit and the combat-log line
+    // it prints (attacker = base.transform.name, victim = CurrentAggroTarget.transform.name; the
+    // skill variant uses _skill.NPCUses with the same two sources). Several native routines inside
+    // the same DoNonRaidBehavior frame assign CurrentAggroTarget with a direct field store, so a
+    // duelist can reach Combat() pointed at itself or at the wrong participant before Tick() gets a
+    // chance to re-pin - which is what rendered "<Sim> attacks <Sim>".
+    //
+    // This prefix does NOT touch combat text, does not suppress the native message, and does not
+    // alter the damage transaction. It only guarantees that the Duel-owned targeting state native
+    // code is about to read is the correct one. It is inert unless a Practice Duel is active AND
+    // this exact NPC is one of that duel's participants, so world PvE remains completely vanilla.
+    [HarmonyPatch(typeof(NPC), "Combat")]
+    internal static class DuelCombatTargetAttributionPatch
+    {
+        // Three responsibilities, in this exact order:
+        //   1. AdmitNativeCombat  - refuse this frame ONLY for a duel participant that is pointed
+        //      at its own duel opponent before GO. Nothing else is ever refused.
+        //   2. EnsureDuelistCombatTarget - the unchanged combat-text attribution repair, which now
+        //      only pins while the duel is actually armed.
+        //   3. BeginNativeCombat  - mark this NPC as "native Combat frame on the stack" AFTER our
+        //      own writes have landed, so teardown writes arriving from inside the body (a yield
+        //      threshold reached during PerformMeleeHit calls Stop() synchronously) are deferred
+        //      instead of nulling a field native code is about to dereference without a guard.
+        [HarmonyPrefix]
+        [HarmonyPriority(Priority.First)]
+        private static bool Prefix(NPC __instance, ref bool __state)
+        {
+            __state = false;
+            try
+            {
+                if (!DuelController.AdmitNativeCombat(__instance)) return false;
+                DuelController.EnsureDuelistCombatTarget(__instance);
+                __state = DuelController.BeginNativeCombat(__instance);
+            }
+            catch { }
+            return true;
+        }
+
+        // A finalizer (not a postfix) so the scope is released even if native Combat throws, and
+        // the pending disarm is still applied. The exception itself is returned unchanged - it is
+        // never swallowed.
+        [HarmonyFinalizer]
+        private static Exception Finalizer(Exception __exception, NPC __instance, bool __state)
+        {
+            try { if (__state) DuelController.EndNativeCombat(__instance); } catch { }
+            return __exception;
         }
     }
 
