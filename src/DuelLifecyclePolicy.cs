@@ -112,9 +112,14 @@ namespace ErenshorDuel
             if (!IsCombatActive(state)) return "FAIL lifecycle: active combat phase";
             if (!TryTransition(state, DuelLifecycleTrigger.Terminal, out state) || state != DuelLifecycleState.Cleaning)
                 return "FAIL lifecycle: active -> cleaning";
-            if (CanStart(state) || IsSessionActive(state)) return "FAIL lifecycle: cleaning gate";
+            // Cleaning is a real inter-duel gate, not a hidden extension of Active: no further
+            // virtual-combat mutation is admissible once Terminal has fired, and no challenge may
+            // start until the CleanupComplete trigger has actually been observed.
+            if (CanStart(state) || IsSessionActive(state) || IsCombatActive(state))
+                return "FAIL lifecycle: cleaning gate must reject both new challenges and virtual combat";
             if (!TryTransition(state, DuelLifecycleTrigger.CleanupComplete, out state) || state != DuelLifecycleState.Idle)
                 return "FAIL lifecycle: cleaning -> idle";
+            if (!CanStart(state)) return "FAIL lifecycle: a challenge must be accepted immediately once cleanup completes";
 
             DuelLifecycleState duplicate;
             if (TryTransition(DuelLifecycleState.Active, DuelLifecycleTrigger.ChallengeAccepted, out duplicate))

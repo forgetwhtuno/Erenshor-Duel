@@ -43,6 +43,22 @@ namespace ErenshorDuel
             return active || hasResidualParticipantState;
         }
 
+        // Whether an ARMED post-duel cleanup pass should finalize (call EndPostDuelAttackCleanup)
+        // on this tick, given its remaining frame budget and time deadline. Deliberately NOT also
+        // usable as the "is anything pending" gate at the top of RunPostDuelAttackCleanup:
+        // remainingFrames reaches 0 within a handful of ordinary frames, long before the time
+        // deadline, so by the frame the deadline is finally reached remainingFrames is already
+        // <=0. Using this exact condition as BOTH the top fast-exit guard AND the bottom finalize
+        // decision (the original 0.4.7/0.4.9 shape) meant the fast-exit guard silently returned on
+        // the one frame that should have finalized - on every ordinary-speed duel, forever, since
+        // nothing else ever called EndPostDuelAttackCleanup() again until application shutdown.
+        // RunPostDuelAttackCleanup now gates on an explicit _postDuelCleanupPending flag instead,
+        // and calls this function only to decide the actual finalize moment.
+        internal static bool ShouldFinalizeCleanupPass(int remainingFrames, float now, float until)
+        {
+            return remainingFrames <= 0 && now >= until;
+        }
+
         // Starting a practice duel while native autoattack is already engaged would make terminal
         // cleanup own a combat loop that predates the duel. Fail closed instead of trying to
         // reconstruct that unrelated combat state afterward.
@@ -177,6 +193,52 @@ namespace ErenshorDuel
                 return "FAIL safety: virtual yield threshold";
             if (ThirdPartyHealChangesVirtualHealth())
                 return "FAIL safety: third-party heal changed virtual health";
+
+            if (ShouldFinalizeCleanupPass(1, 10f, 0.75f))
+                return "FAIL safety: cleanup must not finalize while frame budget remains";
+            if (ShouldFinalizeCleanupPass(0, 0.5f, 0.75f))
+                return "FAIL safety: cleanup must not finalize before the time deadline";
+            if (!ShouldFinalizeCleanupPass(0, 0.75f, 0.75f))
+                return "FAIL safety: cleanup must finalize once both the frame and time budgets are spent";
+            if (!ShouldFinalizeCleanupPass(-4, 0.9f, 0.75f))
+                return "FAIL safety: cleanup must still finalize once frames have run past zero";
+
+            // Regression proof for the exact discovered live defect: simulate
+            // RunPostDuelAttackCleanup's real per-tick shape at a nominal 60fps for two full
+            // seconds (comfortably past the 0.75s deadline) two ways, using this SAME production
+            // decision function both times.
+            //
+            // OLD shape (0.4.7-0.4.9): the same ShouldFinalizeCleanupPass condition gated BOTH the
+            // top fast-exit AND the bottom finalize decision. This must NEVER finalize, because
+            // frames reaches 0 (from the 6-frame budget) long before 0.75s elapses, so by the time
+            // the deadline is reached the top guard already sees remainingFrames<=0 && now>=until
+            // and returns before the bottom check - the actual historical bug.
+            {
+                int frames = 6; const float until = 0.75f; bool finalizedOld = false;
+                for (float now = 0f; now <= 2f; now += 1f / 60f)
+                {
+                    if (ShouldFinalizeCleanupPass(frames, now, until)) break; // old top guard fires here
+                    frames--;
+                    if (ShouldFinalizeCleanupPass(frames, now, until)) { finalizedOld = true; break; }
+                }
+                if (finalizedOld)
+                    return "FAIL safety: regression simulation of the OLD combined-guard shape unexpectedly finalized - this proof is stale";
+            }
+
+            // NEW shape: an explicit pending flag gates the top of RunPostDuelAttackCleanup instead
+            // of re-checking the finalize condition; ShouldFinalizeCleanupPass is consulted only
+            // once, at the bottom, to decide whether THIS tick is the one that finalizes. This must
+            // reach finalization well within the simulated two seconds.
+            {
+                int frames = 6; const float until = 0.75f; bool pending = true; bool finalizedNew = false;
+                for (float now = 0f; now <= 2f && pending; now += 1f / 60f)
+                {
+                    frames--;
+                    if (ShouldFinalizeCleanupPass(frames, now, until)) { pending = false; finalizedNew = true; }
+                }
+                if (!finalizedNew)
+                    return "FAIL safety: pending-flag-guarded cleanup must actually finalize during ordinary 60fps ticking";
+            }
 
             return "PASS safety";
         }

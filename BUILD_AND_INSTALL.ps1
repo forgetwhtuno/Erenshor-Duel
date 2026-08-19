@@ -60,7 +60,8 @@ $refs = @(
     (Join-Path $managed "Assembly-CSharp.dll"), (Join-Path $managed "netstandard.dll"),
     (Join-Path $managed "UnityEngine.dll"), (Join-Path $managed "UnityEngine.CoreModule.dll"),
     (Join-Path $managed "UnityEngine.UIModule.dll"), (Join-Path $managed "UnityEngine.TextRenderingModule.dll"),
-    (Join-Path $managed "UnityEngine.UI.dll")
+    (Join-Path $managed "UnityEngine.UI.dll"), (Join-Path $managed "Unity.TextMeshPro.dll"),
+    (Join-Path $managed "UnityEngine.InputLegacyModule.dll")
 )
 foreach ($ref in $refs) { if (-not (Test-Path $ref)) { throw "Missing reference: $ref" } }
 $out = Join-Path $pluginDir "ErenshorDuel.dll"
